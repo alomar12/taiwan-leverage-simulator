@@ -2,13 +2,15 @@
 from pathlib import Path
 from datetime import date
 import io
+import time
+import requests
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.2", layout="wide")
+st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.3", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -173,36 +175,208 @@ def database_status(db: pd.DataFrame):
     return pd.DataFrame(rows)
 
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def download_twse_taiex_month(year: int, month: int):
+    """證交所官方 TAIEX 每月 OHLC。"""
+    yyyymm01 = f"{year:04d}{month:02d}01"
+    url = "https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.twse.com.tw/zh/indices/taiex/mi-5min-hist.html",
+    }
+
+    last_error = None
+    for attempt in range(5):
+        try:
+            resp = requests.get(
+                url,
+                params={"date": yyyymm01, "response": "json"},
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                time.sleep(2 + attempt * 2)
+                continue
+            resp.raise_for_status()
+            obj = resp.json()
+
+            if obj.get("stat") != "OK":
+                return empty_database()
+
+            rows = obj.get("data", [])
+            if not rows:
+                return empty_database()
+
+            out = []
+            for row in rows:
+                roc = str(row[0]).strip().split("/")
+                if len(roc) != 3:
+                    continue
+                gy = int(roc[0]) + 1911
+                dt = pd.Timestamp(gy, int(roc[1]), int(roc[2]))
+                close = float(str(row[4]).replace(",", "").strip())
+                out.append({
+                    "Date": dt,
+                    "Symbol": "TAIEX",
+                    "Close": close,
+                    "AdjClose": close,
+                })
+            return pd.DataFrame(out, columns=DB_COLUMNS)
+
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 + attempt * 1.5)
+
+    raise RuntimeError(
+        f"證交所官方TAIEX {year}/{month:02d} 下載失敗：{last_error}"
+    )
+
+
+def month_starts(start, end):
+    p = pd.Timestamp(start).replace(day=1)
+    e = pd.Timestamp(end).replace(day=1)
+    while p <= e:
+        yield p
+        p = p + pd.offsets.MonthBegin(1)
+
+
+def download_twse_taiex_range(start: str, end: str, progress_label=True):
+    """
+    逐月下載證交所官方 TAIEX。
+    只用來建立/補齊固定歷史資料庫，不在一般回測時執行。
+    """
+    months = list(month_starts(start, end))
+    pieces = []
+    prog = st.progress(0) if progress_label and months else None
+
+    for i, m in enumerate(months, start=1):
+        piece = download_twse_taiex_month(m.year, m.month)
+        if piece is not None and not piece.empty:
+            pieces.append(piece)
+        if prog is not None:
+            prog.progress(i / len(months))
+
+        # 證交所逐月端點避免過度頻繁請求
+        if i < len(months):
+            time.sleep(0.45)
+
+    if prog is not None:
+        prog.empty()
+
+    if not pieces:
+        return empty_database()
+    return pd.concat(pieces, ignore_index=True)
+
+
+def ensure_official_taiex_history(db: pd.DataFrame, start="1999-01-01", end=None):
+    """
+    將 TAIEX 1999 起缺少的月份，以證交所官方資料補入。
+    已存在的月份不再下載。
+    """
+    end = pd.Timestamp(end or date.today().isoformat())
+    start = pd.Timestamp(start)
+
+    existing = db.loc[db["Symbol"] == "TAIEX", ["Date"]].copy()
+    existing_months = set()
+    if not existing.empty:
+        existing_months = set(
+            pd.to_datetime(existing["Date"]).dt.to_period("M").astype(str)
+        )
+
+    needed = [
+        m for m in month_starts(start, end)
+        if str(m.to_period("M")) not in existing_months
+    ]
+
+    if not needed:
+        return db, 0
+
+    pieces = []
+    prog = st.progress(0)
+    status_box = st.empty()
+
+    for i, m in enumerate(needed, start=1):
+        status_box.caption(
+            f"補齊證交所官方 TAIEX：{m.year}/{m.month:02d} "
+            f"（{i}/{len(needed)}）"
+        )
+        piece = download_twse_taiex_month(m.year, m.month)
+        if piece is not None and not piece.empty:
+            pieces.append(piece)
+
+        prog.progress(i / len(needed))
+        if i < len(needed):
+            time.sleep(0.45)
+
+    prog.empty()
+    status_box.empty()
+
+    if pieces:
+        official = pd.concat(pieces, ignore_index=True)
+        db = merge_database(db, official)
+        return db, len(official)
+
+    return db, 0
+
+
 def update_database(db: pd.DataFrame, full_rebuild=False, end=None):
+    """
+    混合資料源：
+    - TAIEX：Yahoo 只作快速補近期；1999起完整歷史由 TWSE 官方逐月補齊。
+    - 0050 / 00631L：Yahoo Finance，主要用途是保留 Adj Close。
+    """
     end = end or date.today().isoformat()
-    all_new = []
-    progress = st.progress(0)
-
-    for i, (key, info) in enumerate(SYMBOLS.items(), start=1):
-        if full_rebuild or db.empty:
-            start = info["start"]
-        else:
-            x = db.loc[db["Symbol"] == key]
-            if x.empty:
-                start = info["start"]
-            else:
-                # 重抓最後14日，修正晚到資料或資料源微調
-                start = (x["Date"].max() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
-
-        new = download_yahoo_long(key, start, end)
-        all_new.append(new)
-        progress.progress(i / len(SYMBOLS))
-
-    progress.empty()
-    fresh = pd.concat(all_new, ignore_index=True) if all_new else empty_database()
 
     if full_rebuild:
-        out = fresh
+        base = empty_database()
     else:
-        out = merge_database(db, fresh)
+        base = db.copy()
 
-    save_local_database(out)
-    return out
+    all_new = []
+    keys = ["0050", "00631L", "TAIEX"]
+    prog = st.progress(0)
+
+    for i, key in enumerate(keys, start=1):
+        info = SYMBOLS[key]
+        if full_rebuild or base.empty:
+            # TAIEX 的早期歷史由 TWSE 官方負責；Yahoo只抓較近期資料，
+            # 可顯著降低 Yahoo 長區間失敗造成的影響。
+            if key == "TAIEX":
+                start = "2009-01-01"
+            else:
+                start = info["start"]
+        else:
+            x = base.loc[base["Symbol"] == key]
+            if x.empty:
+                start = "2009-01-01" if key == "TAIEX" else info["start"]
+            else:
+                start = (x["Date"].max() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+
+        try:
+            new = download_yahoo_long(key, start, end)
+            all_new.append(new)
+        except Exception:
+            # Yahoo掛掉不阻止TAIEX官方歷史補齊；
+            # 0050/00631L若已有本地資料也可繼續使用。
+            pass
+
+        prog.progress(i / len(keys))
+
+    prog.empty()
+
+    if all_new:
+        fresh = pd.concat(all_new, ignore_index=True)
+        base = merge_database(base, fresh)
+
+    # 最重要：TAIEX 1999年至今缺漏月份，以證交所官方資料補齊。
+    base, _ = ensure_official_taiex_history(
+        base, start="1999-01-01", end=end
+    )
+
+    save_local_database(base)
+    return base
 
 
 # ============================================================
@@ -551,9 +725,9 @@ def pareto_frontier(df):
 # ============================================================
 # UI
 # ============================================================
-st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.2")
+st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.3")
 st.caption(
-    "v1.2 改為『本地歷史資料庫優先』：一般回測不連Yahoo Finance；"
+    "v1.3 改為『本地歷史資料庫優先』：一般回測不連Yahoo Finance；"
     "只有在資料管理頁按更新時，才下載缺少的最新交易日。"
 )
 
@@ -829,7 +1003,7 @@ with tabs[2]:
         st.subheader("2000 / 2008 股災壓力測試")
         mode = st.selectbox(
             "歷史期間",
-            ["2000網路泡沫（TAIEX代理）", "2008金融海嘯（0050代理）"]
+            ["2000網路泡沫（官方TAIEX）", "2008金融海嘯（官方TAIEX）"]
         )
         model_mode = st.radio(
             "正2生成方式",
@@ -839,17 +1013,20 @@ with tabs[2]:
 
         if mode.startswith("2000"):
             base = actual["twii"]["Close"].loc["2000-01-01":"2002-12-31"].dropna()
+            if base.empty or base.index.min() > pd.Timestamp("2000-01-31"):
+                st.error("本地資料庫缺少2000年TAIEX。請到「⑤ 資料管理」按『補齊1999年至今官方TAIEX』。")
+                st.stop()
             ur = base.pct_change().dropna()
             br = ur.copy()
-            st.info("2000年沒有0050與00631L，這裡使用TAIEX作市場代理，因此是壓力測試，不是真實00631L回測。")
+            st.info("2000年沒有0050與00631L；使用證交所官方TAIEX重建歷史正2，因此屬壓力測試。")
         else:
-            close0050, _ = repair_split_jumps(
-                actual["d0050"]["Close"].loc["2007-01-01":"2009-12-31"].dropna()
-            )
-            ur = close0050.pct_change().dropna()
-            adj = actual["d0050"]["AdjClose"].reindex(ur.index).dropna()
-            br = adj.pct_change().reindex(ur.index).fillna(0)
-            st.info("2008年00631L尚未上市；使用0050當時實際行情生成模擬正2。")
+            base = actual["twii"]["Close"].loc["2007-01-01":"2009-12-31"].dropna()
+            if base.empty or base.index.min() > pd.Timestamp("2007-01-31"):
+                st.error("本地資料庫缺少2007–2009年TAIEX。請到「⑤ 資料管理」按『補齊1999年至今官方TAIEX』。")
+                st.stop()
+            ur = base.pct_change().dropna()
+            br = ur.copy()
+            st.info("2008年00631L尚未上市；改用證交所官方TAIEX重建模擬正2，避免0050早期資料來源不完整。")
 
         if model_mode == "波動狀態抽樣":
             n_mc = st.slider("蒙地卡羅路徑數", 50, 1000, 300, 50)
@@ -956,17 +1133,33 @@ with tabs[4]:
 
     st.dataframe(status, use_container_width=True)
 
+    taiex_rows = db.loc[db["Symbol"] == "TAIEX"].copy() if not db.empty else empty_database()
+    if taiex_rows.empty:
+        st.warning("TAIEX 尚無資料。2000／2008壓力測試目前不能執行。")
+    else:
+        taiex_start = pd.to_datetime(taiex_rows["Date"]).min()
+        if taiex_start > pd.Timestamp("1999-01-31"):
+            st.warning(
+                f"TAIEX目前最早只有 {taiex_start.date()}，尚不足以測2000年股災。"
+                "請按『補齊1999年至今官方TAIEX』。"
+            )
+        else:
+            st.success(
+                f"TAIEX早期歷史已涵蓋至 {taiex_start.date()}，"
+                "可進行2000與2008壓力測試。"
+            )
+
     if db.empty:
         st.warning("目前資料庫是空的。第一次部署後，請按「建立完整歷史資料庫」。")
     else:
         latest = db["Date"].max()
         st.success(f"本地資料庫目前最新日期：{latest.date().isoformat()}")
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("建立完整歷史資料庫", type="primary"):
+        if st.button("建立／重建完整資料庫", type="primary"):
             try:
-                with st.spinner("第一次建立資料庫：下載1999年至今資料…"):
+                with st.spinner("建立資料庫並以證交所官方資料補齊TAIEX…"):
                     db = update_database(db, full_rebuild=True)
                 st.success("完整歷史資料庫已建立。")
                 st.rerun()
@@ -976,12 +1169,25 @@ with tabs[4]:
     with c2:
         if st.button("只更新最新缺漏資料"):
             try:
-                with st.spinner("只下載各資料最後日期附近至今天的資料…"):
+                with st.spinner("更新近期資料並檢查TAIEX月份缺漏…"):
                     db = update_database(db, full_rebuild=False)
                 st.success("資料庫已更新。")
                 st.rerun()
             except Exception as e:
                 st.error(f"更新失敗：{e}")
+
+    with c3:
+        if st.button("補齊1999年至今官方TAIEX"):
+            try:
+                with st.spinner("從證交所官方逐月補齊缺少的TAIEX月份…"):
+                    db, added = ensure_official_taiex_history(
+                        db, start="1999-01-01", end=date.today().isoformat()
+                    )
+                    save_local_database(db)
+                st.success(f"TAIEX補齊完成，本次新增／補入 {added:,} 筆交易日資料。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"官方TAIEX補齊失敗：{e}")
 
     st.divider()
     st.markdown("#### 匯入／匯出資料庫")
@@ -1036,6 +1242,6 @@ with tabs[4]:
 
 st.divider()
 st.caption(
-    "v1.2：歷史資料以本地資料庫為主；2000年使用TAIEX代理。"
+    "v1.3：TAIEX 1999年至今缺漏由證交所官方資料補齊；2000與2008均以官方TAIEX做壓力測試。"
     "歷史回測與模型最佳化均不代表未來報酬。"
 )

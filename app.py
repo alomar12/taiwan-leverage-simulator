@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.3", layout="wide")
+st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.5", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -576,6 +576,58 @@ def make_level(ret, start=100):
     return start * (1 + ret.fillna(0)).cumprod()
 
 
+
+def build_long_history_series(actual, coef, calibration, vol_q):
+    """
+    1999年至今長期研究序列。
+    市場基準使用官方TAIEX；模擬正2為每日 2x TAIEX 報酬
+    加上2014年至今實際00631L校準所得的條件偏差。
+
+    1999-2013不是00631L真實歷史，只能視為歷史重建／壓力測試。
+    """
+    twii = actual["twii"]["Close"].dropna().sort_index()
+    if twii.empty:
+        raise RuntimeError("TAIEX歷史資料為空。")
+
+    market_ret = twii.pct_change().fillna(0)
+    sim_2x_ret = synthetic_2x_returns(
+        market_ret, coef, calibration, vol_q, "校準平均", 42
+    )
+    market_level = 100.0 * twii / float(twii.iloc[0])
+    sim_2x_level = make_level(sim_2x_ret, start=100.0)
+
+    chart = pd.DataFrame({
+        "TAIEX大盤": market_level,
+        "模擬正2": sim_2x_level.reindex(market_level.index),
+    })
+
+    if not actual["p2x"].empty:
+        p2x = actual["p2x"].dropna()
+        actual_2x = 100.0 * p2x / float(p2x.iloc[0])
+        chart["實際00631L（上市後）"] = actual_2x.reindex(chart.index)
+
+    return {
+        "market_level": twii,
+        "market_ret": market_ret,
+        "sim_2x_ret": sim_2x_ret,
+        "sim_2x_level": sim_2x_level,
+        "chart": chart,
+    }
+
+
+def slice_returns_and_level(ret, level, start_date):
+    """從使用者指定日期起，取第一個可用交易日作投資起點。"""
+    start = pd.Timestamp(start_date)
+    idx = ret.index.intersection(level.index)
+    idx = idx[idx >= start]
+    if len(idx) < 2:
+        raise RuntimeError("指定投資起日之後沒有足夠交易資料。")
+    r = ret.reindex(idx).copy()
+    lvl = level.reindex(idx).ffill().copy()
+    # 第一個交易日固定視為投入日，不先承受當日報酬
+    r.iloc[0] = 0.0
+    return r, lvl, idx[0]
+
 # ============================================================
 # 策略與績效
 # ============================================================
@@ -708,6 +760,326 @@ def metrics(eq, initial_capital, n_rebal=0, turnover=0):
     }
 
 
+
+def buy_leveraged_with_cash(lev, cash, amount, buy_cost):
+    """只用現金買正2；絕不允許負現金或融資。"""
+    max_buy = cash / (1 + buy_cost) if buy_cost >= 0 else cash
+    x = max(0.0, min(float(amount), max_buy))
+    cost = x * buy_cost
+    lev += x
+    cash -= x + cost
+    if cash < 1e-8:
+        cash = 0.0
+    return lev, cash, x, cost
+
+
+def sell_leveraged_to_cash(lev, cash, amount, sell_cost):
+    """賣出正2轉回現金。"""
+    x = max(0.0, min(float(amount), lev))
+    cost = x * sell_cost
+    lev -= x
+    cash += x - cost
+    return lev, cash, x, cost
+
+
+def rebalance_to_initial_target(lev, cash, target, buy_cost, sell_cost):
+    """回復原始正2／現金配置。"""
+    return rebalance_to_target(lev, cash, target, buy_cost, sell_cost)
+
+
+def simulate_ladder_buy_strategy(
+    lev_ret,
+    market_level,
+    capital,
+    initial_lev_target=0.50,
+    start_drawdown=0.20,
+    drawdown_step=0.05,
+    buy_step=0.05,
+    buy_basis="當下總資產",
+    exit_style="回到前高一次再平衡",
+    rebound_start=0.10,
+    rebound_step=0.10,
+    sell_step=0.05,
+    cash_yield=0.0,
+    buy_cost=0.0,
+    sell_cost=0.0,
+):
+    """
+    越跌越買策略：
+    - 起始：initial_lev_target 正2，其餘現金。
+    - 市場自前次歷史高點回撤 start_drawdown，買第一階。
+    - 之後每再跌 drawdown_step，再買一階。
+    - 每階買 buy_step × 當下總資產（或初始本金）。
+    - 可以把現金買到 0，但禁止融資。
+    - 反彈端三種：
+      1) 回到前高一次再平衡。
+      2) 低點反彈指定幅度一次再平衡。
+      3) 低點反彈分批再平衡，前高時強制完成。
+    """
+    idx = lev_ret.index.intersection(market_level.index)
+    if len(idx) < 2:
+        raise ValueError("可用交易日不足。")
+
+    r = lev_ret.reindex(idx).fillna(0)
+    market = market_level.reindex(idx).ffill()
+
+    lev = capital * initial_lev_target
+    cash = capital * (1 - initial_lev_target)
+    daily_cash = (1 + cash_yield) ** (1 / 252) - 1
+
+    # 以尚未進入本輪下跌前的歷史高點為參考高點
+    reference_peak = float(market.iloc[0])
+    cycle_active = False
+    cycle_peak = reference_peak
+    cycle_low = reference_peak
+
+    next_buy_trigger = start_drawdown
+    next_sell_trigger = rebound_start
+    buy_stage = 0
+    sell_stage = 0
+    n_buys = 0
+    n_sells = 0
+    n_resets = 0
+    turnover = 0.0
+
+    rows = []
+    events = []
+    cash_exhausted_dates = []
+
+    first_dt = idx[0]
+    rows.append((
+        first_dt, capital, lev, cash,
+        lev / capital if capital else 0.0,
+        0.0, reference_peak, reference_peak,
+        0.0, "", buy_stage, sell_stage
+    ))
+
+    for dt in idx[1:]:
+        lev *= 1 + float(r.loc[dt])
+        cash *= 1 + daily_cash
+        mkt = float(market.loc[dt])
+
+        if (not cycle_active) and mkt > reference_peak:
+            reference_peak = mkt
+
+        drawdown = mkt / reference_peak - 1.0 if reference_peak > 0 else 0.0
+        reason_parts = []
+
+        # 啟動一輪下跌加碼
+        if (not cycle_active) and drawdown <= -start_drawdown:
+            cycle_active = True
+            cycle_peak = reference_peak
+            cycle_low = mkt
+            next_buy_trigger = start_drawdown
+            next_sell_trigger = rebound_start
+            buy_stage = 0
+            sell_stage = 0
+            reason_parts.append("啟動加碼循環")
+            events.append({
+                "Date": dt,
+                "Event": "啟動加碼循環",
+                "Market": mkt,
+                "Drawdown": drawdown,
+                "ReboundFromLow": 0.0,
+                "Amount": 0.0,
+                "CashAfter": cash,
+                "LevAfter": lev,
+            })
+
+        if cycle_active:
+            # 新低時更新本輪低點。分批反彈門檻重新從最新低點計算，
+            # 但已經執行過的賣出階數不回復，避免反覆買賣同一階。
+            if mkt < cycle_low:
+                cycle_low = mkt
+
+            cycle_dd_abs = max(0.0, 1.0 - mkt / cycle_peak)
+
+            # ----------------------------------------------------
+            # 下跌：跨過幾個門檻，就補幾階，直到現金用完
+            # ----------------------------------------------------
+            while (
+                cash > 1e-8
+                and next_buy_trigger < 1.0
+                and cycle_dd_abs + 1e-12 >= next_buy_trigger
+            ):
+                total_before = lev + cash
+                if buy_basis == "初始本金":
+                    desired_buy = capital * buy_step
+                else:
+                    desired_buy = total_before * buy_step
+
+                lev, cash, bought, cost = buy_leveraged_with_cash(
+                    lev, cash, desired_buy, buy_cost
+                )
+                turnover += bought
+                n_buys += 1
+                buy_stage += 1
+
+                reason_parts.append(f"第{buy_stage}階加碼")
+                events.append({
+                    "Date": dt,
+                    "Event": f"第{buy_stage}階加碼",
+                    "Market": mkt,
+                    "Drawdown": -cycle_dd_abs,
+                    "ReboundFromLow": mkt / cycle_low - 1 if cycle_low > 0 else 0.0,
+                    "Trigger": next_buy_trigger,
+                    "Amount": bought,
+                    "Cost": cost,
+                    "CashAfter": cash,
+                    "LevAfter": lev,
+                })
+
+                next_buy_trigger += drawdown_step
+
+                if cash <= 1e-8:
+                    cash = 0.0
+                    cash_exhausted_dates.append(dt)
+                    reason_parts.append("現金用完")
+                    events.append({
+                        "Date": dt,
+                        "Event": "現金用完",
+                        "Market": mkt,
+                        "Drawdown": -cycle_dd_abs,
+                        "ReboundFromLow": mkt / cycle_low - 1 if cycle_low > 0 else 0.0,
+                        "Amount": 0.0,
+                        "CashAfter": cash,
+                        "LevAfter": lev,
+                    })
+                    break
+
+            rebound = mkt / cycle_low - 1.0 if cycle_low > 0 else 0.0
+
+            # ----------------------------------------------------
+            # 反彈：一次再平衡
+            # ----------------------------------------------------
+            do_full_reset = False
+            reset_reason = ""
+
+            if exit_style == "回到前高一次再平衡":
+                if mkt >= cycle_peak:
+                    do_full_reset = True
+                    reset_reason = "回到前高"
+
+            elif exit_style == "低點反彈指定幅度一次再平衡":
+                if rebound >= rebound_start:
+                    do_full_reset = True
+                    reset_reason = f"低點反彈{rebound_start:.0%}"
+
+            # ----------------------------------------------------
+            # 反彈：分批賣正2
+            # ----------------------------------------------------
+            elif exit_style == "低點反彈分批再平衡":
+                # 每跨過一個反彈門檻賣一階，但不賣到低於原始配置。
+                while rebound + 1e-12 >= next_sell_trigger:
+                    total_before = lev + cash
+                    min_lev = total_before * initial_lev_target
+                    excess_lev = max(0.0, lev - min_lev)
+
+                    if excess_lev <= 1e-8:
+                        break
+
+                    desired_sell = total_before * sell_step
+                    sell_amount = min(desired_sell, excess_lev)
+
+                    lev, cash, sold, cost = sell_leveraged_to_cash(
+                        lev, cash, sell_amount, sell_cost
+                    )
+                    turnover += sold
+                    n_sells += 1
+                    sell_stage += 1
+
+                    reason_parts.append(f"第{sell_stage}階反彈減碼")
+                    events.append({
+                        "Date": dt,
+                        "Event": f"第{sell_stage}階反彈減碼",
+                        "Market": mkt,
+                        "Drawdown": mkt / cycle_peak - 1 if cycle_peak > 0 else 0.0,
+                        "ReboundFromLow": rebound,
+                        "Trigger": next_sell_trigger,
+                        "Amount": sold,
+                        "Cost": cost,
+                        "CashAfter": cash,
+                        "LevAfter": lev,
+                    })
+
+                    next_sell_trigger += rebound_step
+
+                # 回到前高，不論前面分批完成多少，都強制回原始配置
+                if mkt >= cycle_peak:
+                    do_full_reset = True
+                    reset_reason = "回到前高強制完成"
+
+            if do_full_reset:
+                lev, cash, traded = rebalance_to_initial_target(
+                    lev, cash, initial_lev_target, buy_cost, sell_cost
+                )
+                turnover += traded
+                n_resets += 1
+                reason_parts.append(f"{reset_reason}→恢復原始配置")
+
+                events.append({
+                    "Date": dt,
+                    "Event": f"{reset_reason}→恢復原始配置",
+                    "Market": mkt,
+                    "Drawdown": mkt / cycle_peak - 1 if cycle_peak > 0 else 0.0,
+                    "ReboundFromLow": rebound,
+                    "Amount": traded,
+                    "CashAfter": cash,
+                    "LevAfter": lev,
+                })
+
+                # 完成本輪，重新建立下一輪歷史高點基準
+                cycle_active = False
+                reference_peak = max(reference_peak, mkt)
+                cycle_peak = reference_peak
+                cycle_low = reference_peak
+                next_buy_trigger = start_drawdown
+                next_sell_trigger = rebound_start
+                buy_stage = 0
+                sell_stage = 0
+
+        total = lev + cash
+        lev_weight = lev / total if total > 0 else 0.0
+        current_rebound = (
+            mkt / cycle_low - 1.0
+            if cycle_active and cycle_low > 0
+            else 0.0
+        )
+
+        rows.append((
+            dt, total, lev, cash, lev_weight,
+            drawdown, reference_peak, cycle_low,
+            current_rebound, "；".join(reason_parts),
+            buy_stage, sell_stage
+        ))
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "Date", "Portfolio", "Leveraged", "Cash", "LevWeight",
+            "MarketDrawdown", "ReferencePeak", "CycleLow",
+            "ReboundFromLow", "Reason", "BuyStage", "SellStage"
+        ],
+    ).set_index("Date")
+
+    df["Peak"] = df["Portfolio"].cummax()
+    df["Drawdown"] = df["Portfolio"] / df["Peak"] - 1
+
+    event_df = pd.DataFrame(events)
+    if not event_df.empty:
+        event_df = event_df.set_index("Date").sort_index()
+
+    stats = {
+        "加碼次數": n_buys,
+        "反彈分批減碼次數": n_sells,
+        "完整重置次數": n_resets,
+        "現金用完次數": len(cash_exhausted_dates),
+        "首次現金用完日期": cash_exhausted_dates[0] if cash_exhausted_dates else None,
+        "累計換手金額": turnover,
+    }
+    return df, event_df, stats
+
+
 def pareto_frontier(df):
     vals = df[["CAGR", "最大回撤"]].values
     keep = np.ones(len(df), dtype=bool)
@@ -725,9 +1097,9 @@ def pareto_frontier(df):
 # ============================================================
 # UI
 # ============================================================
-st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.3")
+st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.5")
 st.caption(
-    "v1.3 改為『本地歷史資料庫優先』：一般回測不連Yahoo Finance；"
+    "v1.5 改為『本地歷史資料庫優先』：一般回測不連Yahoo Finance；"
     "只有在資料管理頁按更新時，才下載缺少的最新交易日。"
 )
 
@@ -773,7 +1145,8 @@ tabs = st.tabs([
     "② 參數最佳化",
     "③ 2000/2008壓力測試",
     "④ 正2偏差模型",
-    "⑤ 資料管理",
+    "⑤ 越跌越買策略",
+    "⑥ 資料管理",
 ])
 
 actual = None
@@ -797,30 +1170,86 @@ else:
 # ----------------------------
 with tabs[0]:
     if not has_required_data:
-        st.warning(f"{prep_error} 請先到「⑤ 資料管理」建立或匯入資料庫。")
+        st.warning(f"{prep_error} 請先到「⑥ 資料管理」建立或匯入資料庫。")
     else:
-        p2x = actual["p2x"]
-        lev_level = 100 * p2x / float(p2x.iloc[0])
+        st.subheader("回測資料模式與投資起點")
+        backtest_mode = st.radio(
+            "資料模式",
+            [
+                "2014/10/31至今｜實際0050＋實際00631L",
+                "1999年至今｜官方TAIEX＋校準模擬正2",
+            ],
+            horizontal=True,
+            key="main_backtest_mode",
+        )
+
+        if backtest_mode.startswith("2014"):
+            min_start = max(pd.Timestamp("2014-10-31"), actual["r2x"].index.min())
+            max_start = actual["r2x"].index.max() - pd.Timedelta(days=1)
+            default_start = min_start
+        else:
+            long_data = build_long_history_series(actual, coef, calibration, vol_q)
+            min_start = long_data["market_ret"].index.min()
+            max_start = long_data["market_ret"].index.max() - pd.Timedelta(days=1)
+            default_start = min_start
+
+        invest_start = st.date_input(
+            "投資開始日期",
+            value=default_start.date(),
+            min_value=min_start.date(),
+            max_value=max_start.date(),
+            key="main_invest_start",
+        )
+
+        if backtest_mode.startswith("2014"):
+            raw_ret = actual["r2x"]
+            raw_level = 100 * actual["p2x"] / float(actual["p2x"].iloc[0])
+            lev_ret_bt, lev_level_bt, actual_start = slice_returns_and_level(
+                raw_ret, raw_level, invest_start
+            )
+            bench_ret = actual["r0050_total"].reindex(lev_ret_bt.index).fillna(0).copy()
+            bench_ret.iloc[0] = 0.0
+            bench_name = "100% 0050"
+            lev_name = f"{target_pct}% 實際00631L＋現金"
+            data_note = (
+                "本模式完全使用00631L上市後的實際日報酬；"
+                "0050使用還原價格計算總報酬。"
+            )
+        else:
+            raw_ret = long_data["sim_2x_ret"]
+            raw_level = long_data["sim_2x_level"]
+            lev_ret_bt, lev_level_bt, actual_start = slice_returns_and_level(
+                raw_ret, raw_level, invest_start
+            )
+            bench_ret = long_data["market_ret"].reindex(lev_ret_bt.index).fillna(0).copy()
+            bench_ret.iloc[0] = 0.0
+            bench_name = "100% TAIEX大盤"
+            lev_name = f"{target_pct}% 模擬正2＋現金"
+            data_note = (
+                "1999–2013的正2為模型重建值，不是00631L實際歷史。"
+                "模型以TAIEX逐日報酬×2，再加上2014年至今正2實際追蹤偏差的校準結果。"
+            )
+
+        st.info(f"實際投入起始交易日：{actual_start.date()}。{data_note}")
 
         strat, nreb, turnover = simulate_rebalance(
-            actual["r2x"], lev_level, capital, target,
+            lev_ret_bt, lev_level_bt, capital, target,
             trigger_mode, down_trigger, up_trigger, band,
             cash_yield, buy_cost, sell_cost, min_days
         )
-        bench = simulate_benchmark(
-            actual["r0050_total"].reindex(strat.index).fillna(0), capital
-        )
+        bench = simulate_benchmark(bench_ret.reindex(strat.index).fillna(0), capital)
 
-        c0, c1, c2, c3 = st.columns(4)
+        c0, c1, c2, c3, c4 = st.columns(5)
         c0.metric("初始總資產", f"{capital:,.0f} 元")
         c1.metric("初始正2", f"{capital * target:,.0f} 元")
         c2.metric("初始現金", f"{capital * (1-target):,.0f} 元")
         c3.metric("初始約當曝險", f"{target * 2:.0%}")
+        c4.metric("投資起日", actual_start.strftime("%Y/%m/%d"))
 
         summary = pd.DataFrame([
             metrics(bench["Portfolio"], capital),
             metrics(strat["Portfolio"], capital, nreb, turnover),
-        ], index=["100% 0050", f"{target_pct}% 正2＋現金"])
+        ], index=[bench_name, lev_name])
 
         st.dataframe(
             summary.style.format({
@@ -838,17 +1267,39 @@ with tabs[0]:
         )
 
         curve = pd.concat([
-            bench["Portfolio"].rename("100% 0050"),
-            strat["Portfolio"].rename("正2＋現金"),
+            bench["Portfolio"].rename(bench_name),
+            strat["Portfolio"].rename(lev_name),
         ], axis=1)
         st.line_chart(curve)
 
         st.caption("回撤")
         dd = pd.concat([
-            bench["Drawdown"].rename("100% 0050"),
-            strat["Drawdown"].rename("正2＋現金"),
+            bench["Drawdown"].rename(bench_name),
+            strat["Drawdown"].rename(lev_name),
         ], axis=1)
         st.line_chart(dd)
+
+        if not backtest_mode.startswith("2014"):
+            st.divider()
+            st.subheader("1999年至今｜大盤、模擬正2與實際00631L走勢")
+            st.caption(
+                "三條線都正規化為各自起始值100。實際00631L只會從2014/10/31之後出現；"
+                "1999–2013的模擬正2用來研究若當時存在每日2倍產品可能出現的路徑。"
+            )
+            long_chart = long_data["chart"].loc[pd.Timestamp(invest_start):].copy()
+            # 讓比較更直觀：從選定起日重新正規化TAIEX與模擬正2為100
+            for col in ["TAIEX大盤", "模擬正2"]:
+                valid = long_chart[col].dropna()
+                if not valid.empty:
+                    long_chart[col] = 100 * long_chart[col] / float(valid.iloc[0])
+            st.line_chart(long_chart)
+
+            # 顯示2014後模型與實際00631L的校驗差距
+            compare = long_data["chart"][["模擬正2", "實際00631L（上市後）"]].dropna()
+            if not compare.empty:
+                compare = compare / compare.iloc[0] * 100
+                st.caption("2014/10/31後：模擬正2 vs 實際00631L（同日起點=100）")
+                st.line_chart(compare)
 
         with st.expander("前10個交易日資產檢核"):
             audit = strat[["Portfolio", "Leveraged", "Cash", "LevWeight"]].head(10)
@@ -1014,7 +1465,7 @@ with tabs[2]:
         if mode.startswith("2000"):
             base = actual["twii"]["Close"].loc["2000-01-01":"2002-12-31"].dropna()
             if base.empty or base.index.min() > pd.Timestamp("2000-01-31"):
-                st.error("本地資料庫缺少2000年TAIEX。請到「⑤ 資料管理」按『補齊1999年至今官方TAIEX』。")
+                st.error("本地資料庫缺少2000年TAIEX。請到「⑥ 資料管理」按『補齊1999年至今官方TAIEX』。")
                 st.stop()
             ur = base.pct_change().dropna()
             br = ur.copy()
@@ -1022,7 +1473,7 @@ with tabs[2]:
         else:
             base = actual["twii"]["Close"].loc["2007-01-01":"2009-12-31"].dropna()
             if base.empty or base.index.min() > pd.Timestamp("2007-01-31"):
-                st.error("本地資料庫缺少2007–2009年TAIEX。請到「⑤ 資料管理」按『補齊1999年至今官方TAIEX』。")
+                st.error("本地資料庫缺少2007–2009年TAIEX。請到「⑥ 資料管理」按『補齊1999年至今官方TAIEX』。")
                 st.stop()
             ur = base.pct_change().dropna()
             br = ur.copy()
@@ -1122,9 +1573,280 @@ with tabs[3]:
 
 
 # ----------------------------
-# ⑤ 資料管理
+# ⑤ 越跌越買策略
 # ----------------------------
 with tabs[4]:
+    st.subheader("越跌越買到現金用完｜反彈後再平衡")
+
+    if not has_required_data:
+        st.warning("請先建立本地市場資料庫。")
+    else:
+        st.write(
+            "這個策略允許現金一路投入到 0，但不允許融資。"
+            "下跌門檻以市場指數／0050相對『本輪下跌前歷史高點』計算；"
+            "加碼資產為正2。"
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            ladder_initial_pct = st.slider(
+                "初始正2比例（%）", 10, 80, 50, 5, key="ladder_initial"
+            )
+        with c2:
+            ladder_start_dd_pct = st.slider(
+                "回撤幾%開始第一階加碼", 5, 50, 20, 5, key="ladder_start_dd"
+            )
+        with c3:
+            ladder_dd_step_pct = st.slider(
+                "之後每再跌幾%加碼一階", 2, 20, 5, 1, key="ladder_dd_step"
+            )
+        with c4:
+            ladder_buy_pct = st.slider(
+                "每階投入比例（%）", 1, 20, 5, 1, key="ladder_buy_pct"
+            )
+
+        c5, c6 = st.columns(2)
+        with c5:
+            ladder_buy_basis = st.radio(
+                "每階投入比例的計算基礎",
+                ["當下總資產", "初始本金"],
+                horizontal=True,
+                key="ladder_buy_basis"
+            )
+        with c6:
+            ladder_exit_style = st.selectbox(
+                "反彈後如何再平衡",
+                [
+                    "回到前高一次再平衡",
+                    "低點反彈指定幅度一次再平衡",
+                    "低點反彈分批再平衡",
+                ],
+                key="ladder_exit_style"
+            )
+
+        rebound_start_pct = 20
+        rebound_step_pct = 10
+        sell_step_pct = 5
+
+        if ladder_exit_style == "低點反彈指定幅度一次再平衡":
+            rebound_start_pct = st.slider(
+                "自本輪最低點反彈幾%後，一次恢復原始配置",
+                5, 100, 20, 5, key="ladder_rebound_once"
+            )
+
+        elif ladder_exit_style == "低點反彈分批再平衡":
+            c7, c8, c9 = st.columns(3)
+            with c7:
+                rebound_start_pct = st.slider(
+                    "低點反彈幾%開始第一階減碼",
+                    5, 80, 10, 5, key="ladder_rebound_start"
+                )
+            with c8:
+                rebound_step_pct = st.slider(
+                    "之後每再漲幾%減碼一階",
+                    5, 50, 10, 5, key="ladder_rebound_step"
+                )
+            with c9:
+                sell_step_pct = st.slider(
+                    "每階轉回現金比例（總資產%）",
+                    1, 20, 5, 1, key="ladder_sell_step"
+                )
+
+            st.caption(
+                "分批減碼不會把正2降到低於原始正2比例；"
+                "若市場先回到本輪前高，會把尚未完成的部分一次恢復原始配置。"
+            )
+
+        test_period = st.radio(
+            "測試期間／資料",
+            [
+                "2014/10/31至今｜實際00631L＋0050",
+                "2000–2002｜官方TAIEX＋校準模擬正2",
+                "2007–2009｜官方TAIEX＋校準模擬正2",
+            ],
+            key="ladder_period"
+        )
+
+        if test_period.startswith("2014"):
+            lev_ret_ladder = actual["r2x"]
+            market_level_ladder = actual["p0050"].reindex(
+                lev_ret_ladder.index
+            ).ffill()
+            benchmark_ret_ladder = actual["r0050_total"].reindex(
+                lev_ret_ladder.index
+            ).fillna(0)
+            benchmark_name = "100% 0050"
+            data_note = "實際00631L日報酬；0050價格作為前高／回撤訊號。"
+
+        elif test_period.startswith("2000"):
+            mkt = actual["twii"]["Close"].loc[
+                "2000-01-01":"2002-12-31"
+            ].dropna()
+            if mkt.empty or mkt.index.min() > pd.Timestamp("2000-01-31"):
+                st.error("缺少2000年官方TAIEX，請先到「⑥ 資料管理」補齊。")
+                st.stop()
+            uret = mkt.pct_change().fillna(0)
+            lev_ret_ladder = synthetic_2x_returns(
+                uret, coef, calibration, vol_q, "校準平均", 42
+            )
+            market_level_ladder = mkt.reindex(lev_ret_ladder.index).ffill()
+            benchmark_ret_ladder = uret
+            benchmark_name = "100% TAIEX"
+            data_note = "2000年沒有00631L，使用官方TAIEX＋2014年至今正2偏差模型。"
+
+        else:
+            mkt = actual["twii"]["Close"].loc[
+                "2007-01-01":"2009-12-31"
+            ].dropna()
+            if mkt.empty or mkt.index.min() > pd.Timestamp("2007-01-31"):
+                st.error("缺少2007–2009官方TAIEX，請先到「⑥ 資料管理」補齊。")
+                st.stop()
+            uret = mkt.pct_change().fillna(0)
+            lev_ret_ladder = synthetic_2x_returns(
+                uret, coef, calibration, vol_q, "校準平均", 42
+            )
+            market_level_ladder = mkt.reindex(lev_ret_ladder.index).ffill()
+            benchmark_ret_ladder = uret
+            benchmark_name = "100% TAIEX"
+            data_note = "2008年沒有00631L，使用官方TAIEX＋2014年至今正2偏差模型。"
+
+        st.info(data_note)
+
+        ladder_df, ladder_events, ladder_stats = simulate_ladder_buy_strategy(
+            lev_ret=lev_ret_ladder,
+            market_level=market_level_ladder,
+            capital=capital,
+            initial_lev_target=ladder_initial_pct / 100,
+            start_drawdown=ladder_start_dd_pct / 100,
+            drawdown_step=ladder_dd_step_pct / 100,
+            buy_step=ladder_buy_pct / 100,
+            buy_basis=ladder_buy_basis,
+            exit_style=ladder_exit_style,
+            rebound_start=rebound_start_pct / 100,
+            rebound_step=rebound_step_pct / 100,
+            sell_step=sell_step_pct / 100,
+            cash_yield=cash_yield,
+            buy_cost=buy_cost,
+            sell_cost=sell_cost,
+        )
+
+        bench_ladder = simulate_benchmark(
+            benchmark_ret_ladder.reindex(ladder_df.index).fillna(0), capital
+        )
+
+        ladder_metric = metrics(
+            ladder_df["Portfolio"],
+            capital,
+            ladder_stats["加碼次數"] + ladder_stats["反彈分批減碼次數"] + ladder_stats["完整重置次數"],
+            ladder_stats["累計換手金額"],
+        )
+        bench_metric = metrics(bench_ladder["Portfolio"], capital)
+
+        summary_ladder = pd.DataFrame(
+            [bench_metric, ladder_metric],
+            index=[benchmark_name, "越跌越買策略"]
+        )
+
+        st.dataframe(
+            summary_ladder.style.format({
+                "期末資產": "{:,.0f}",
+                "累積報酬": "{:.1%}",
+                "CAGR": "{:.2%}",
+                "年化波動": "{:.2%}",
+                "最大回撤": "{:.2%}",
+                "Sharpe(無風險=0)": "{:.2f}",
+                "Calmar": "{:.2f}",
+                "再平衡次數": "{:.0f}",
+                "累計換手金額": "{:,.0f}",
+            }),
+            use_container_width=True
+        )
+
+        c10, c11, c12, c13 = st.columns(4)
+        c10.metric("加碼次數", f"{ladder_stats['加碼次數']}")
+        c11.metric("反彈分批減碼", f"{ladder_stats['反彈分批減碼次數']}")
+        c12.metric("完整重置", f"{ladder_stats['完整重置次數']}")
+        c13.metric("現金用完次數", f"{ladder_stats['現金用完次數']}")
+
+        if ladder_stats["首次現金用完日期"] is not None:
+            st.warning(
+                "此參數組合曾把現金全部投入。首次發生日期："
+                f"{pd.Timestamp(ladder_stats['首次現金用完日期']).date()}"
+            )
+
+        st.line_chart(pd.concat([
+            bench_ladder["Portfolio"].rename(benchmark_name),
+            ladder_df["Portfolio"].rename("越跌越買策略"),
+        ], axis=1))
+
+        st.caption("投資組合回撤")
+        st.line_chart(pd.concat([
+            bench_ladder["Drawdown"].rename(benchmark_name),
+            ladder_df["Drawdown"].rename("越跌越買策略"),
+        ], axis=1))
+
+        st.caption("正2占總資產比例")
+        st.line_chart(
+            (ladder_df[["LevWeight"]] * 100).rename(
+                columns={"LevWeight": "正2占比（%）"}
+            )
+        )
+
+        st.caption("現金部位")
+        st.line_chart(ladder_df[["Cash"]])
+
+        with st.expander("查看所有加碼／反彈減碼／重置事件"):
+            if ladder_events.empty:
+                st.info("此期間沒有觸發事件。")
+            else:
+                st.dataframe(
+                    ladder_events.style.format({
+                        "Market": "{:,.2f}",
+                        "Drawdown": "{:.2%}",
+                        "ReboundFromLow": "{:.2%}",
+                        "Trigger": "{:.2%}",
+                        "Amount": "{:,.0f}",
+                        "Cost": "{:,.0f}",
+                        "CashAfter": "{:,.0f}",
+                        "LevAfter": "{:,.0f}",
+                    }, na_rep=""),
+                    use_container_width=True
+                )
+
+        with st.expander("策略規則摘要"):
+            st.write(
+                f"起始：正2 {ladder_initial_pct}%＋現金 {100-ladder_initial_pct}%。"
+            )
+            st.write(
+                f"市場自前高回撤 {ladder_start_dd_pct}% 開始第一階加碼，"
+                f"之後每再跌 {ladder_dd_step_pct}% 再加碼。"
+            )
+            st.write(
+                f"每階投入：{ladder_buy_pct}% × {ladder_buy_basis}；"
+                "現金可用到 0，但不使用融資。"
+            )
+            if ladder_exit_style == "回到前高一次再平衡":
+                st.write("反彈：回到本輪下跌前高時，一次恢復原始配置。")
+            elif ladder_exit_style == "低點反彈指定幅度一次再平衡":
+                st.write(
+                    f"反彈：自本輪最低點上漲 {rebound_start_pct}% 時，"
+                    "一次恢復原始配置。"
+                )
+            else:
+                st.write(
+                    f"反彈：低點上漲 {rebound_start_pct}% 開始減碼，"
+                    f"每再漲 {rebound_step_pct}% 再減碼一階；"
+                    f"每階將當下總資產 {sell_step_pct}% 從正2轉回現金。"
+                )
+                st.write(
+                    "若先回到本輪前高，尚未完成的部分會一次恢復原始配置。"
+                )
+
+
+# ----------------------------
+# ⑥ 資料管理
+# ----------------------------
+with tabs[5]:
     st.subheader("本地市場資料庫")
     st.write(
         "一般回測只讀取 GitHub 專案內的 `data/market_daily.csv`。"
@@ -1242,6 +1964,6 @@ with tabs[4]:
 
 st.divider()
 st.caption(
-    "v1.3：TAIEX 1999年至今缺漏由證交所官方資料補齊；2000與2008均以官方TAIEX做壓力測試。"
+    "v1.5：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
     "歷史回測與模型最佳化均不代表未來報酬。"
 )

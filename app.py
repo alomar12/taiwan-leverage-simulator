@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.8", layout="wide")
+st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.9", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -1798,13 +1798,67 @@ def render_long_market_chart(long_chart, key_prefix):
     st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_long_plot")
 
 
+
+def minimum_position_stats(strategy_df):
+    """
+    回傳投資期間最低資產統計：
+    1) 總資產最低時點，以及該日正2/現金
+    2) 正2部位歷史最低值與日期
+    3) 現金部位歷史最低值與日期
+    """
+    if strategy_df is None or strategy_df.empty:
+        return None
+
+    required = {"Portfolio", "Leveraged", "Cash"}
+    if not required.issubset(strategy_df.columns):
+        return None
+
+    x = strategy_df[list(required)].copy().dropna(how="all")
+    if x.empty:
+        return None
+
+    min_total_date = x["Portfolio"].idxmin()
+    min_lev_date = x["Leveraged"].idxmin()
+    min_cash_date = x["Cash"].idxmin()
+
+    return {
+        "最低總資產日期": pd.Timestamp(min_total_date),
+        "最低總資產": float(x.loc[min_total_date, "Portfolio"]),
+        "最低總資產時正2": float(x.loc[min_total_date, "Leveraged"]),
+        "最低總資產時現金": float(x.loc[min_total_date, "Cash"]),
+        "最低正2日期": pd.Timestamp(min_lev_date),
+        "最低正2": float(x.loc[min_lev_date, "Leveraged"]),
+        "最低現金日期": pd.Timestamp(min_cash_date),
+        "最低現金": float(x.loc[min_cash_date, "Cash"]),
+    }
+
+
+def render_minimum_position_stats(strategy_df, title="投資期間最低資產統計"):
+    stats = minimum_position_stats(strategy_df)
+    if stats is None:
+        return
+
+    st.markdown(f"### {title}")
+
+    a, b, c, d = st.columns(4)
+    a.metric("最低總資產", f"{stats['最低總資產']:,.0f} 元")
+    b.metric("發生日期", stats["最低總資產日期"].strftime("%Y/%m/%d"))
+    c.metric("當日正2", f"{stats['最低總資產時正2']:,.0f} 元")
+    d.metric("當日現金", f"{stats['最低總資產時現金']:,.0f} 元")
+
+    e, f, g, h = st.columns(4)
+    e.metric("正2歷史最低", f"{stats['最低正2']:,.0f} 元")
+    f.metric("正2最低日期", stats["最低正2日期"].strftime("%Y/%m/%d"))
+    g.metric("現金歷史最低", f"{stats['最低現金']:,.0f} 元")
+    h.metric("現金最低日期", stats["最低現金日期"].strftime("%Y/%m/%d"))
+
 # ============================================================
 # UI
 # ============================================================
-st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.8")
+st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.9")
 st.caption(
-    "v1.8：互動圖新增再平衡事件記號，可直接查看每次買進、減碼、重置的日期、"
-    "調整金額與正2／現金前後變化。"
+    "v1.9：新增投資期間最低資產統計；可查看最低總資產時的正2／現金，"
+    "以及正2與現金各自的歷史最低值與日期。"
 )
 
 db = get_local_database()
@@ -1971,6 +2025,11 @@ with tabs[0]:
                 "累計換手金額": "{:,.0f}",
             }),
             use_container_width=True
+        )
+
+        render_minimum_position_stats(
+            strat,
+            title=f"{lev_name}｜投資期間最低資產統計"
         )
 
         st.subheader("互動資產走勢")
@@ -2548,6 +2607,11 @@ with tabs[4]:
             use_container_width=True
         )
 
+        render_minimum_position_stats(
+            ladder_df,
+            title="越跌越買策略｜投資期間最低資產統計"
+        )
+
         c10, c11, c12, c13 = st.columns(4)
         c10.metric("加碼次數", f"{ladder_stats['加碼次數']}")
         c11.metric("反彈分批減碼", f"{ladder_stats['反彈分批減碼次數']}")
@@ -2975,6 +3039,6 @@ with tabs[6]:
 
 st.divider()
 st.caption(
-    "v1.8：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
+    "v1.9：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
     "歷史回測與模型最佳化均不代表未來報酬。"
 )

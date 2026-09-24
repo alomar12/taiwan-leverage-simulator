@@ -9,12 +9,22 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.5", layout="wide")
+st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.8", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_FILE = DATA_DIR / "market_daily.csv"
+FNG_FILE = DATA_DIR / "fear_greed_daily.csv"
+
+FNG_COLUMNS = ["Date", "FearGreed", "Rating", "Source"]
+FNG_COMBINED_URL = (
+    "https://raw.githubusercontent.com/whit3rabbit/"
+    "fear-greed-data/main/fear-greed.csv"
+)
+FNG_RECON_END = pd.Timestamp("2021-01-29")
+FNG_CNN_START = pd.Timestamp("2021-02-01")
 
 SYMBOLS = {
     "TAIEX": {
@@ -35,6 +45,213 @@ SYMBOLS = {
 }
 
 DB_COLUMNS = ["Date", "Symbol", "Close", "AdjClose"]
+
+
+
+# ============================================================
+# CNN Fear & Greed 本地資料庫
+# ============================================================
+def empty_fng_database():
+    return pd.DataFrame(columns=FNG_COLUMNS)
+
+
+@st.cache_data(show_spinner=False)
+def read_local_fng(path_str: str, modified_ns: int = 0):
+    path = Path(path_str)
+    if not path.exists() or path.stat().st_size == 0:
+        return empty_fng_database()
+
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return empty_fng_database()
+
+    if df.empty:
+        return empty_fng_database()
+
+    # 相容舊/外部欄位名稱
+    rename_map = {
+        "Fear Greed": "FearGreed",
+        "fear_and_greed_index": "FearGreed",
+        "date": "Date",
+        "rating": "Rating",
+        "source": "Source",
+    }
+    df = df.rename(columns=rename_map)
+
+    if "Date" not in df.columns or "FearGreed" not in df.columns:
+        raise RuntimeError("Fear & Greed 資料必須至少包含 Date、FearGreed。")
+
+    if "Rating" not in df.columns:
+        df["Rating"] = ""
+    if "Source" not in df.columns:
+        df["Source"] = np.where(
+            pd.to_datetime(df["Date"], errors="coerce") <= FNG_RECON_END,
+            "reconstructed",
+            "cnn_official_via_mirror",
+        )
+
+    df = df[FNG_COLUMNS].copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["FearGreed"] = pd.to_numeric(df["FearGreed"], errors="coerce")
+    df["Rating"] = df["Rating"].fillna("").astype(str).str.lower()
+    df["Source"] = df["Source"].fillna("").astype(str)
+    df = (
+        df.dropna(subset=["Date", "FearGreed"])
+          .drop_duplicates("Date", keep="last")
+          .sort_values("Date")
+          .reset_index(drop=True)
+    )
+    return df
+
+
+def get_local_fng():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    modified = FNG_FILE.stat().st_mtime_ns if FNG_FILE.exists() else 0
+    return read_local_fng(str(FNG_FILE), modified)
+
+
+def fng_rating(score):
+    if pd.isna(score):
+        return ""
+    score = float(score)
+    if score < 25:
+        return "extreme fear"
+    if score < 45:
+        return "fear"
+    if score < 55:
+        return "neutral"
+    if score < 75:
+        return "greed"
+    return "extreme greed"
+
+
+def save_local_fng(df: pd.DataFrame):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out = df.copy()
+    if out.empty:
+        out = empty_fng_database()
+
+    for c in FNG_COLUMNS:
+        if c not in out.columns:
+            if c == "Rating":
+                out[c] = out.get("FearGreed", pd.Series(dtype=float)).apply(fng_rating)
+            elif c == "Source":
+                out[c] = np.where(
+                    pd.to_datetime(out.get("Date"), errors="coerce") <= FNG_RECON_END,
+                    "reconstructed",
+                    "cnn_official_via_mirror",
+                )
+            else:
+                out[c] = np.nan
+
+    out = out[FNG_COLUMNS].copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out["FearGreed"] = pd.to_numeric(out["FearGreed"], errors="coerce")
+    out["Rating"] = out["Rating"].fillna("").astype(str).str.lower()
+    out["Source"] = out["Source"].fillna("").astype(str)
+    out = (
+        out.dropna(subset=["Date", "FearGreed"])
+           .drop_duplicates("Date", keep="last")
+           .sort_values("Date")
+    )
+    out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
+    out.to_csv(FNG_FILE, index=False, encoding="utf-8-sig")
+    st.cache_data.clear()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def download_fng_combined():
+    """
+    下載 whit3rabbit/fear-greed-data 的 canonical combined CSV。
+    2011-01-03 ~ 2021-01-29：第三方歷史重建
+    2021-02-01 ~ 現在：該專案由 CNN 現行端點每日更新的尾端
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+    }
+    resp = requests.get(FNG_COMBINED_URL, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    raw = pd.read_csv(io.StringIO(resp.text))
+    raw = raw.rename(columns={
+        "Fear Greed": "FearGreed",
+        "fear_and_greed_index": "FearGreed",
+        "date": "Date",
+        "rating": "Rating",
+    })
+    if "Date" not in raw.columns or "FearGreed" not in raw.columns:
+        raise RuntimeError("下載的 Fear & Greed CSV 欄位格式不符預期。")
+
+    if "Rating" not in raw.columns:
+        raw["Rating"] = ""
+
+    raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+    raw["FearGreed"] = pd.to_numeric(raw["FearGreed"], errors="coerce")
+    raw["Rating"] = raw["Rating"].fillna("").astype(str).str.lower()
+    raw.loc[raw["Rating"].eq(""), "Rating"] = (
+        raw.loc[raw["Rating"].eq(""), "FearGreed"].apply(fng_rating)
+    )
+    raw["Source"] = np.where(
+        raw["Date"] <= FNG_RECON_END,
+        "reconstructed",
+        "cnn_official_via_mirror",
+    )
+    raw = (
+        raw[FNG_COLUMNS]
+        .dropna(subset=["Date", "FearGreed"])
+        .drop_duplicates("Date", keep="last")
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    return raw
+
+
+def align_fng_to_taiwan_dates(tw_dates, fng_df):
+    """
+    重要：CNN F&G 是美國收盤後才知道。
+    台灣同一曆日交易發生在美國該日收盤之前，所以不能用同日 F&G。
+    對每個台灣交易日，只使用「嚴格早於該日期」的最新 F&G。
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(tw_dates)).sort_values()
+    left = pd.DataFrame({"TWDate": idx})
+    if fng_df is None or fng_df.empty:
+        out = left.copy()
+        out["FNGDate"] = pd.NaT
+        out["FearGreed"] = np.nan
+        out["Rating"] = ""
+        out["Source"] = ""
+        return out.set_index("TWDate")
+
+    right = fng_df.copy().sort_values("Date").rename(columns={"Date": "FNGDate"})
+    merged = pd.merge_asof(
+        left.sort_values("TWDate"),
+        right.sort_values("FNGDate"),
+        left_on="TWDate",
+        right_on="FNGDate",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    return merged.set_index("TWDate")
+
+
+def fng_multiplier_from_score(score, multipliers):
+    if pd.isna(score):
+        return 1.0
+    s = float(score)
+    if s < 25:
+        return float(multipliers["extreme fear"])
+    if s < 45:
+        return float(multipliers["fear"])
+    if s < 55:
+        return float(multipliers["neutral"])
+    if s < 75:
+        return float(multipliers["greed"])
+    return float(multipliers["extreme greed"])
 
 
 # ============================================================
@@ -673,7 +890,10 @@ def simulate_rebalance(
 
     # 第0筆只記錄起始本金，不先套用報酬
     first_dt = idx[0]
-    rows.append((first_dt, capital, lev, cash, target, "起始"))
+    rows.append((
+        first_dt, capital, lev, cash, target, "起始",
+        0.0, "起始", lev, cash
+    ))
 
     for i, dt in enumerate(idx[1:], start=1):
         lev *= 1 + float(r.loc[dt])
@@ -684,6 +904,10 @@ def simulate_rebalance(
 
         trigger = False
         reason = ""
+        trade_amount_signed = 0.0
+        trade_direction = ""
+        lev_before_trade = lev
+        cash_before_trade = cash
 
         if i - last_rebal_i >= min_days:
             if trigger_mode == "價格漲跌門檻":
@@ -698,9 +922,18 @@ def simulate_rebalance(
                     trigger, reason = True, "高於比例帶"
 
         if trigger:
+            lev_before_trade = lev
+            cash_before_trade = cash
             lev, cash, turnover = rebalance_to_target(
                 lev, cash, target, buy_cost, sell_cost
             )
+            trade_amount_signed = lev - lev_before_trade
+            if trade_amount_signed > 1e-8:
+                trade_direction = "買進正2"
+            elif trade_amount_signed < -1e-8:
+                trade_direction = "賣出正2"
+            else:
+                trade_direction = "無調整"
             turnover_sum += turnover
             n_rebal += 1
             last_rebal_i = i
@@ -708,11 +941,18 @@ def simulate_rebalance(
             total = lev + cash
             weight = lev / total if total > 0 else 0
 
-        rows.append((dt, lev + cash, lev, cash, weight, reason))
+        rows.append((
+            dt, lev + cash, lev, cash, weight, reason,
+            trade_amount_signed, trade_direction,
+            lev_before_trade, cash_before_trade
+        ))
 
     df = pd.DataFrame(
         rows,
-        columns=["Date", "Portfolio", "Leveraged", "Cash", "LevWeight", "Reason"]
+        columns=[
+            "Date", "Portfolio", "Leveraged", "Cash", "LevWeight", "Reason",
+            "TradeAmountSigned", "TradeDirection", "LevBefore", "CashBefore"
+        ]
     ).set_index("Date")
     df["Peak"] = df["Portfolio"].cummax()
     df["Drawdown"] = df["Portfolio"] / df["Peak"] - 1
@@ -803,6 +1043,8 @@ def simulate_ladder_buy_strategy(
     cash_yield=0.0,
     buy_cost=0.0,
     sell_cost=0.0,
+    fng_signal=None,
+    fng_multipliers=None,
 ):
     """
     越跌越買策略：
@@ -822,6 +1064,20 @@ def simulate_ladder_buy_strategy(
 
     r = lev_ret.reindex(idx).fillna(0)
     market = market_level.reindex(idx).ffill()
+
+    if fng_signal is None:
+        fng = pd.Series(index=idx, data=np.nan, dtype=float)
+    else:
+        fng = pd.Series(fng_signal).reindex(idx)
+
+    if fng_multipliers is None:
+        fng_multipliers = {
+            "extreme fear": 1.0,
+            "fear": 1.0,
+            "neutral": 1.0,
+            "greed": 1.0,
+            "extreme greed": 1.0,
+        }
 
     lev = capital * initial_lev_target
     cash = capital * (1 - initial_lev_target)
@@ -878,10 +1134,13 @@ def simulate_ladder_buy_strategy(
             events.append({
                 "Date": dt,
                 "Event": "啟動加碼循環",
+                "TradeDirection": "條件啟動",
                 "Market": mkt,
                 "Drawdown": drawdown,
                 "ReboundFromLow": 0.0,
                 "Amount": 0.0,
+                "LevBefore": lev,
+                "CashBefore": cash,
                 "CashAfter": cash,
                 "LevAfter": lev,
             })
@@ -904,10 +1163,18 @@ def simulate_ladder_buy_strategy(
             ):
                 total_before = lev + cash
                 if buy_basis == "初始本金":
-                    desired_buy = capital * buy_step
+                    base_buy = capital * buy_step
                 else:
-                    desired_buy = total_before * buy_step
+                    base_buy = total_before * buy_step
 
+                fng_score = fng.loc[dt] if dt in fng.index else np.nan
+                fng_mult = fng_multiplier_from_score(
+                    fng_score, fng_multipliers
+                )
+                desired_buy = base_buy * fng_mult
+
+                lev_before_event = lev
+                cash_before_event = cash
                 lev, cash, bought, cost = buy_leveraged_with_cash(
                     lev, cash, desired_buy, buy_cost
                 )
@@ -919,12 +1186,18 @@ def simulate_ladder_buy_strategy(
                 events.append({
                     "Date": dt,
                     "Event": f"第{buy_stage}階加碼",
+                    "TradeDirection": "買進正2",
                     "Market": mkt,
                     "Drawdown": -cycle_dd_abs,
                     "ReboundFromLow": mkt / cycle_low - 1 if cycle_low > 0 else 0.0,
                     "Trigger": next_buy_trigger,
+                    "FNG": fng_score,
+                    "FNGMultiplier": fng_mult,
+                    "BaseAmount": base_buy,
                     "Amount": bought,
                     "Cost": cost,
+                    "LevBefore": lev_before_event,
+                    "CashBefore": cash_before_event,
                     "CashAfter": cash,
                     "LevAfter": lev,
                 })
@@ -938,10 +1211,13 @@ def simulate_ladder_buy_strategy(
                     events.append({
                         "Date": dt,
                         "Event": "現金用完",
+                        "TradeDirection": "現金用完",
                         "Market": mkt,
                         "Drawdown": -cycle_dd_abs,
                         "ReboundFromLow": mkt / cycle_low - 1 if cycle_low > 0 else 0.0,
                         "Amount": 0.0,
+                        "LevBefore": lev,
+                        "CashBefore": cash,
                         "CashAfter": cash,
                         "LevAfter": lev,
                     })
@@ -981,6 +1257,8 @@ def simulate_ladder_buy_strategy(
                     desired_sell = total_before * sell_step
                     sell_amount = min(desired_sell, excess_lev)
 
+                    lev_before_event = lev
+                    cash_before_event = cash
                     lev, cash, sold, cost = sell_leveraged_to_cash(
                         lev, cash, sell_amount, sell_cost
                     )
@@ -992,12 +1270,15 @@ def simulate_ladder_buy_strategy(
                     events.append({
                         "Date": dt,
                         "Event": f"第{sell_stage}階反彈減碼",
+                        "TradeDirection": "賣出正2",
                         "Market": mkt,
                         "Drawdown": mkt / cycle_peak - 1 if cycle_peak > 0 else 0.0,
                         "ReboundFromLow": rebound,
                         "Trigger": next_sell_trigger,
                         "Amount": sold,
                         "Cost": cost,
+                        "LevBefore": lev_before_event,
+                        "CashBefore": cash_before_event,
                         "CashAfter": cash,
                         "LevAfter": lev,
                     })
@@ -1010,8 +1291,15 @@ def simulate_ladder_buy_strategy(
                     reset_reason = "回到前高強制完成"
 
             if do_full_reset:
+                lev_before_event = lev
+                cash_before_event = cash
                 lev, cash, traded = rebalance_to_initial_target(
                     lev, cash, initial_lev_target, buy_cost, sell_cost
+                )
+                reset_direction = (
+                    "買進正2" if lev > lev_before_event + 1e-8
+                    else "賣出正2" if lev < lev_before_event - 1e-8
+                    else "無調整"
                 )
                 turnover += traded
                 n_resets += 1
@@ -1020,10 +1308,13 @@ def simulate_ladder_buy_strategy(
                 events.append({
                     "Date": dt,
                     "Event": f"{reset_reason}→恢復原始配置",
+                    "TradeDirection": reset_direction,
                     "Market": mkt,
                     "Drawdown": mkt / cycle_peak - 1 if cycle_peak > 0 else 0.0,
                     "ReboundFromLow": rebound,
                     "Amount": traded,
+                    "LevBefore": lev_before_event,
+                    "CashBefore": cash_before_event,
                     "CashAfter": cash,
                     "LevAfter": lev,
                 })
@@ -1094,13 +1385,426 @@ def pareto_frontier(df):
     return df.loc[keep].copy()
 
 
+
+# ============================================================
+# 互動圖表與日期查詢
+# ============================================================
+def nearest_trading_date(index, requested_date):
+    idx = pd.DatetimeIndex(index).sort_values()
+    if len(idx) == 0:
+        return None
+    target = pd.Timestamp(requested_date)
+    pos = idx.get_indexer([target], method="nearest")[0]
+    if pos < 0:
+        return None
+    return idx[pos]
+
+
+def _selected_x_from_plotly_event(event):
+    """相容不同 Streamlit Plotly selection 回傳型態。"""
+    try:
+        points = event.selection.points
+        if points:
+            x = points[0].get("x")
+            if x is not None:
+                return pd.Timestamp(x)
+    except Exception:
+        pass
+
+    try:
+        points = event.get("selection", {}).get("points", [])
+        if points:
+            x = points[0].get("x")
+            if x is not None:
+                return pd.Timestamp(x)
+    except Exception:
+        pass
+    return None
+
+
+def portfolio_display_series(series, mode, initial_capital):
+    s = series.astype(float).copy()
+    if mode == "基準化（起點=100）":
+        first = s.dropna().iloc[0]
+        return 100 * s / first if first != 0 else s
+    if mode == "累積報酬（%）":
+        return (s / initial_capital - 1) * 100
+    return s
+
+
+
+def build_fixed_rebalance_events(strategy_df):
+    """把固定比例再平衡結果轉成統一事件格式。"""
+    if strategy_df is None or strategy_df.empty or "Reason" not in strategy_df.columns:
+        return pd.DataFrame()
+    x = strategy_df.loc[
+        strategy_df["Reason"].isin(["下跌門檻", "上漲門檻", "低於比例帶", "高於比例帶"])
+    ].copy()
+    if x.empty:
+        return pd.DataFrame()
+    ev = pd.DataFrame(index=x.index)
+    ev["Event"] = x["Reason"]
+    ev["TradeDirection"] = x["TradeDirection"]
+    ev["Amount"] = x["TradeAmountSigned"].abs()
+    ev["LevBefore"] = x["LevBefore"]
+    ev["CashBefore"] = x["CashBefore"]
+    ev["LevAfter"] = x["Leveraged"]
+    ev["CashAfter"] = x["Cash"]
+    return ev
+
+
+def _event_category(event_name, direction):
+    name = str(event_name or "")
+    direction = str(direction or "")
+    if "現金用完" in name or direction == "現金用完":
+        return "現金用完"
+    if "恢復原始配置" in name or "重置" in name:
+        return "完整重置"
+    if direction == "買進正2" or "加碼" in name or "下跌" in name or "低於比例" in name:
+        return "買進／加碼"
+    if direction == "賣出正2" or "減碼" in name or "上漲" in name or "高於比例" in name:
+        return "賣出／減碼"
+    return "條件啟動"
+
+
+def prepare_event_markers(event_df, strategy_df):
+    """同一天多個階梯事件在圖上合併成一個標記，明細仍逐筆保留。"""
+    if event_df is None or len(event_df) == 0:
+        return pd.DataFrame()
+    ev = event_df.copy()
+    if "Date" in ev.columns:
+        ev["Date"] = pd.to_datetime(ev["Date"])
+        ev = ev.set_index("Date")
+    ev.index = pd.to_datetime(ev.index)
+
+    rows = []
+    priority = {"完整重置": 5, "現金用完": 4, "買進／加碼": 3, "賣出／減碼": 2, "條件啟動": 1}
+    for dt, grp in ev.groupby(ev.index):
+        if dt not in strategy_df.index:
+            continue
+        names = grp["Event"].astype(str).tolist() if "Event" in grp else [""] * len(grp)
+        dirs = grp["TradeDirection"].astype(str).tolist() if "TradeDirection" in grp else [""] * len(grp)
+        cats = [_event_category(n, d) for n, d in zip(names, dirs)]
+        cat = max(cats, key=lambda c: priority.get(c, 0)) if cats else "條件啟動"
+        amount = pd.to_numeric(grp["Amount"], errors="coerce").fillna(0).sum() if "Amount" in grp else 0.0
+        first, last = grp.iloc[0], grp.iloc[-1]
+        srow = strategy_df.loc[dt]
+        rows.append({
+            "Date": dt,
+            "Category": cat,
+            "EventSummary": "；".join(names),
+            "Amount": float(amount),
+            "LevBefore": first.get("LevBefore", np.nan),
+            "CashBefore": first.get("CashBefore", np.nan),
+            "LevAfter": last.get("LevAfter", srow.get("Leveraged", np.nan)),
+            "CashAfter": last.get("CashAfter", srow.get("Cash", np.nan)),
+            "LevWeightAfter": srow.get("LevWeight", np.nan),
+            "Count": len(grp),
+        })
+    return pd.DataFrame(rows).set_index("Date").sort_index() if rows else pd.DataFrame()
+
+
+def render_portfolio_chart(
+    strategy_df,
+    benchmark_series,
+    benchmark_name,
+    strategy_name,
+    initial_capital,
+    key_prefix,
+    default_query_date=None,
+    event_df=None,
+):
+    """
+    互動資產圖：
+    - hover 顯示總資產、正2、現金、正2占比
+    - 點擊任一點後固定顯示當日明細
+    - 可手動查詢日期（自動抓最近交易日）
+    - 線性 / 對數 / 起點100 / 累積報酬% 四種尺度
+    """
+    display_mode = st.radio(
+        "資產走勢顯示方式",
+        ["金額（線性）", "金額（對數）", "基準化（起點=100）", "累積報酬（%）"],
+        horizontal=True,
+        key=f"{key_prefix}_display_mode",
+    )
+
+    strat_raw = strategy_df["Portfolio"].astype(float)
+    bench_raw = benchmark_series.astype(float).reindex(strat_raw.index)
+
+    strat_y = portfolio_display_series(strat_raw, display_mode, initial_capital)
+    bench_y = portfolio_display_series(bench_raw, display_mode, initial_capital)
+
+    custom = np.column_stack([
+        strategy_df["Portfolio"].values,
+        strategy_df["Leveraged"].values,
+        strategy_df["Cash"].values,
+        strategy_df["LevWeight"].values * 100,
+    ])
+
+    if display_mode == "累積報酬（%）":
+        y_label = "累積報酬（%）"
+        y_hover = "%{y:.2f}%"
+    elif display_mode == "基準化（起點=100）":
+        y_label = "指數化數值"
+        y_hover = "%{y:.2f}"
+    else:
+        y_label = "資產金額"
+        y_hover = "%{y:,.0f}"
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=strat_y.index,
+        y=strat_y.values,
+        mode="lines",
+        name=strategy_name,
+        customdata=custom,
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d}</b><br>"
+            + f"{strategy_name}：" + y_hover + "<br>"
+            "總資產：%{customdata[0]:,.0f}<br>"
+            "正2：%{customdata[1]:,.0f}<br>"
+            "現金：%{customdata[2]:,.0f}<br>"
+            "正2占比：%{customdata[3]:.2f}%"
+            "<extra></extra>"
+        ),
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=bench_y.index,
+        y=bench_y.values,
+        mode="lines",
+        name=benchmark_name,
+        customdata=bench_raw.values.reshape(-1, 1),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d}</b><br>"
+            + f"{benchmark_name}：" + y_hover + "<br>"
+            "基準實際資產：%{customdata[0]:,.0f}"
+            "<extra></extra>"
+        ),
+    ))
+
+    marker_events = prepare_event_markers(event_df, strategy_df)
+    show_event_markers = False
+    if not marker_events.empty:
+        show_event_markers = st.checkbox(
+            "顯示再平衡／資金調整事件記號",
+            value=True,
+            key=f"{key_prefix}_show_event_markers",
+        )
+
+    if show_event_markers:
+        category_style = {
+            "買進／加碼": ("triangle-up", 12),
+            "賣出／減碼": ("triangle-down", 12),
+            "完整重置": ("diamond", 13),
+            "現金用完": ("x", 13),
+            "條件啟動": ("circle-open", 11),
+        }
+        for category, grp in marker_events.groupby("Category"):
+            symbol, size = category_style.get(category, ("circle", 11))
+            event_y = strat_y.reindex(grp.index)
+            cdata = np.column_stack([
+                grp["EventSummary"].astype(str).values,
+                grp["Amount"].fillna(0).values,
+                grp["LevBefore"].fillna(np.nan).values,
+                grp["CashBefore"].fillna(np.nan).values,
+                grp["LevAfter"].fillna(np.nan).values,
+                grp["CashAfter"].fillna(np.nan).values,
+                grp["LevWeightAfter"].fillna(np.nan).values * 100,
+                grp["Count"].values,
+            ])
+            fig.add_trace(go.Scatter(
+                x=grp.index,
+                y=event_y.values,
+                mode="markers",
+                name=f"事件｜{category}",
+                marker=dict(symbol=symbol, size=size, line=dict(width=1.5)),
+                customdata=cdata,
+                hovertemplate=(
+                    "<b>%{x|%Y-%m-%d}｜" + category + "</b><br>"
+                    "觸發：%{customdata[0]}<br>"
+                    "當日調整金額合計：%{customdata[1]:,.0f}<br>"
+                    "調整前正2：%{customdata[2]:,.0f}<br>"
+                    "調整前現金：%{customdata[3]:,.0f}<br>"
+                    "調整後正2：%{customdata[4]:,.0f}<br>"
+                    "調整後現金：%{customdata[5]:,.0f}<br>"
+                    "調整後正2占比：%{customdata[6]:.2f}%<br>"
+                    "當日事件筆數：%{customdata[7]:.0f}"
+                    "<extra></extra>"
+                ),
+            ))
+
+    fig.update_layout(
+        height=560,
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h"),
+        yaxis_title=y_label,
+        xaxis_title="日期",
+    )
+    if display_mode == "金額（對數）":
+        fig.update_yaxes(type="log")
+
+    fig.update_xaxes(
+        rangeslider_visible=True,
+        rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1年", step="year", stepmode="backward"),
+                dict(count=5, label="5年", step="year", stepmode="backward"),
+                dict(count=10, label="10年", step="year", stepmode="backward"),
+                dict(count=20, label="20年", step="year", stepmode="backward"),
+                dict(step="all", label="全部"),
+            ]
+        )
+    )
+
+    event = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"{key_prefix}_plot",
+        on_select="rerun",
+        selection_mode="points",
+    )
+
+    clicked_date = _selected_x_from_plotly_event(event)
+
+    min_d = strategy_df.index.min().date()
+    max_d = strategy_df.index.max().date()
+    if default_query_date is None:
+        default_query_date = max_d
+    else:
+        default_query_date = pd.Timestamp(default_query_date).date()
+        default_query_date = min(max(default_query_date, min_d), max_d)
+
+    qcol1, qcol2 = st.columns([1, 2])
+    with qcol1:
+        query_date = st.date_input(
+            "查詢某一天",
+            value=default_query_date,
+            min_value=min_d,
+            max_value=max_d,
+            key=f"{key_prefix}_query_date",
+        )
+    with qcol2:
+        if clicked_date is not None:
+            st.info(
+                f"已點選圖表日期：{clicked_date.date()}。"
+                "下方明細優先顯示點選日期；重新點其他資料點即可切換。"
+            )
+        else:
+            st.caption("可點圖上的資料點，或用左側日期欄查詢。")
+
+    requested = clicked_date if clicked_date is not None else pd.Timestamp(query_date)
+    actual_dt = nearest_trading_date(strategy_df.index, requested)
+
+    if actual_dt is not None:
+        row = strategy_df.loc[actual_dt]
+        bench_val = bench_raw.loc[actual_dt] if actual_dt in bench_raw.index else np.nan
+
+        if pd.Timestamp(requested).normalize() != actual_dt.normalize():
+            st.caption(
+                f"{pd.Timestamp(requested).date()} 非交易日或無資料，"
+                f"顯示最近交易日 {actual_dt.date()}。"
+            )
+
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("日期", actual_dt.strftime("%Y/%m/%d"))
+        d2.metric("總資產", f"{row['Portfolio']:,.0f}")
+        d3.metric("正2", f"{row['Leveraged']:,.0f}")
+        d4.metric("現金", f"{row['Cash']:,.0f}")
+        d5.metric("正2占比", f"{row['LevWeight']:.2%}")
+
+        extra1, extra2 = st.columns(2)
+        extra1.metric(benchmark_name, f"{bench_val:,.0f}" if pd.notna(bench_val) else "—")
+        if "Drawdown" in strategy_df.columns:
+            extra2.metric("策略自高點回撤", f"{row['Drawdown']:.2%}")
+
+        if event_df is not None and len(event_df) > 0:
+            ev = event_df.copy()
+            if "Date" in ev.columns:
+                ev["Date"] = pd.to_datetime(ev["Date"])
+                ev = ev.set_index("Date")
+            ev.index = pd.to_datetime(ev.index)
+            day_events = ev.loc[ev.index.normalize() == actual_dt.normalize()].copy()
+            if not day_events.empty:
+                st.markdown("**當日資金調整事件**")
+                show_cols = [c for c in [
+                    "Event", "TradeDirection", "Amount", "LevBefore", "CashBefore",
+                    "LevAfter", "CashAfter", "Trigger", "FNG", "FNGMultiplier"
+                ] if c in day_events.columns]
+                fmt = {
+                    "Amount": "{:,.0f}", "LevBefore": "{:,.0f}", "CashBefore": "{:,.0f}",
+                    "LevAfter": "{:,.0f}", "CashAfter": "{:,.0f}", "Trigger": "{:.2%}",
+                    "FNG": "{:.1f}", "FNGMultiplier": "{:.2f}×"
+                }
+                st.dataframe(
+                    day_events[show_cols].style.format({k:v for k,v in fmt.items() if k in show_cols}, na_rep=""),
+                    use_container_width=True,
+                )
+
+    return clicked_date
+
+
+def render_long_market_chart(long_chart, key_prefix):
+    """長期大盤/模擬正2/實際正2比較，重點解決早期振幅被壓扁。"""
+    scale = st.radio(
+        "長期走勢尺度",
+        ["線性", "對數（建議）", "各線起點=100"],
+        index=1,
+        horizontal=True,
+        key=f"{key_prefix}_scale",
+    )
+
+    plot_df = long_chart.copy()
+    if scale == "各線起點=100":
+        for col in plot_df.columns:
+            valid = plot_df[col].dropna()
+            if not valid.empty and float(valid.iloc[0]) != 0:
+                plot_df[col] = 100 * plot_df[col] / float(valid.iloc[0])
+
+    fig = go.Figure()
+    for col in plot_df.columns:
+        fig.add_trace(go.Scatter(
+            x=plot_df.index,
+            y=plot_df[col],
+            mode="lines",
+            name=col,
+            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>" + col + "：%{y:,.2f}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        height=560,
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h"),
+        xaxis_title="日期",
+        yaxis_title="指數值",
+    )
+    if scale == "對數（建議）":
+        fig.update_yaxes(type="log")
+
+    fig.update_xaxes(
+        rangeslider_visible=True,
+        rangeselector=dict(
+            buttons=[
+                dict(count=5, label="5年", step="year", stepmode="backward"),
+                dict(count=10, label="10年", step="year", stepmode="backward"),
+                dict(count=20, label="20年", step="year", stepmode="backward"),
+                dict(step="all", label="全部"),
+            ]
+        )
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_long_plot")
+
+
 # ============================================================
 # UI
 # ============================================================
-st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.5")
+st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.8")
 st.caption(
-    "v1.5 改為『本地歷史資料庫優先』：一般回測不連Yahoo Finance；"
-    "只有在資料管理頁按更新時，才下載缺少的最新交易日。"
+    "v1.8：互動圖新增再平衡事件記號，可直接查看每次買進、減碼、重置的日期、"
+    "調整金額與正2／現金前後變化。"
 )
 
 db = get_local_database()
@@ -1135,6 +1839,8 @@ up_trigger = up_pct / 100
 band = band_pct / 100
 
 status = database_status(db)
+fng_db = get_local_fng()
+
 has_required_data = (
     not db.empty and
     all((db["Symbol"] == s).any() for s in ["TAIEX", "0050", "00631L"])
@@ -1146,7 +1852,8 @@ tabs = st.tabs([
     "③ 2000/2008壓力測試",
     "④ 正2偏差模型",
     "⑤ 越跌越買策略",
-    "⑥ 資料管理",
+    "⑥ Fear & Greed研究",
+    "⑦ 資料管理",
 ])
 
 actual = None
@@ -1170,7 +1877,7 @@ else:
 # ----------------------------
 with tabs[0]:
     if not has_required_data:
-        st.warning(f"{prep_error} 請先到「⑥ 資料管理」建立或匯入資料庫。")
+        st.warning(f"{prep_error} 請先到「⑦ 資料管理」建立或匯入資料庫。")
     else:
         st.subheader("回測資料模式與投資起點")
         backtest_mode = st.radio(
@@ -1266,11 +1973,18 @@ with tabs[0]:
             use_container_width=True
         )
 
-        curve = pd.concat([
-            bench["Portfolio"].rename(bench_name),
-            strat["Portfolio"].rename(lev_name),
-        ], axis=1)
-        st.line_chart(curve)
+        st.subheader("互動資產走勢")
+        fixed_events = build_fixed_rebalance_events(strat)
+        render_portfolio_chart(
+            strategy_df=strat,
+            benchmark_series=bench["Portfolio"],
+            benchmark_name=bench_name,
+            strategy_name=lev_name,
+            initial_capital=capital,
+            key_prefix="main_portfolio",
+            default_query_date=actual_start,
+            event_df=fixed_events,
+        )
 
         st.caption("回撤")
         dd = pd.concat([
@@ -1287,19 +2001,14 @@ with tabs[0]:
                 "1999–2013的模擬正2用來研究若當時存在每日2倍產品可能出現的路徑。"
             )
             long_chart = long_data["chart"].loc[pd.Timestamp(invest_start):].copy()
-            # 讓比較更直觀：從選定起日重新正規化TAIEX與模擬正2為100
-            for col in ["TAIEX大盤", "模擬正2"]:
-                valid = long_chart[col].dropna()
-                if not valid.empty:
-                    long_chart[col] = 100 * long_chart[col] / float(valid.iloc[0])
-            st.line_chart(long_chart)
+            render_long_market_chart(long_chart, "main_long_history")
 
             # 顯示2014後模型與實際00631L的校驗差距
             compare = long_data["chart"][["模擬正2", "實際00631L（上市後）"]].dropna()
             if not compare.empty:
                 compare = compare / compare.iloc[0] * 100
                 st.caption("2014/10/31後：模擬正2 vs 實際00631L（同日起點=100）")
-                st.line_chart(compare)
+                render_long_market_chart(compare, "main_model_actual_compare")
 
         with st.expander("前10個交易日資產檢核"):
             audit = strat[["Portfolio", "Leveraged", "Cash", "LevWeight"]].head(10)
@@ -1325,10 +2034,25 @@ with tabs[0]:
             for w in actual["warnings"]:
                 st.warning(w)
 
-        trades = strat.loc[strat["Reason"].isin(["下跌門檻", "上漲門檻", "低於比例帶", "高於比例帶"])]
+        trades = strat.loc[
+            strat["Reason"].isin(["下跌門檻", "上漲門檻", "低於比例帶", "高於比例帶"]),
+            ["Portfolio", "Leveraged", "Cash", "LevWeight", "Reason", "TradeDirection",
+             "TradeAmountSigned", "LevBefore", "CashBefore"]
+        ].copy()
+        trades["調整金額"] = trades["TradeAmountSigned"].abs()
+        trades = trades.rename(columns={
+            "Portfolio": "總資產", "LevWeight": "正2占比", "Reason": "觸發條件",
+            "TradeDirection": "調整方向", "LevBefore": "調整前正2", "CashBefore": "調整前現金",
+            "Leveraged": "調整後正2", "Cash": "調整後現金"
+        })
         with st.expander(f"再平衡紀錄（{len(trades)}次）"):
             st.dataframe(
-                trades[["Portfolio", "Leveraged", "Cash", "LevWeight", "Reason"]],
+                trades[["總資產", "正2占比", "觸發條件", "調整方向", "調整金額",
+                        "調整前正2", "調整前現金", "調整後正2", "調整後現金"]].style.format({
+                    "總資產": "{:,.0f}", "正2占比": "{:.2%}", "調整金額": "{:,.0f}",
+                    "調整前正2": "{:,.0f}", "調整前現金": "{:,.0f}",
+                    "調整後正2": "{:,.0f}", "調整後現金": "{:,.0f}"
+                }),
                 use_container_width=True
             )
 
@@ -1465,7 +2189,7 @@ with tabs[2]:
         if mode.startswith("2000"):
             base = actual["twii"]["Close"].loc["2000-01-01":"2002-12-31"].dropna()
             if base.empty or base.index.min() > pd.Timestamp("2000-01-31"):
-                st.error("本地資料庫缺少2000年TAIEX。請到「⑥ 資料管理」按『補齊1999年至今官方TAIEX』。")
+                st.error("本地資料庫缺少2000年TAIEX。請到「⑦ 資料管理」按『補齊1999年至今官方TAIEX』。")
                 st.stop()
             ur = base.pct_change().dropna()
             br = ur.copy()
@@ -1473,7 +2197,7 @@ with tabs[2]:
         else:
             base = actual["twii"]["Close"].loc["2007-01-01":"2009-12-31"].dropna()
             if base.empty or base.index.min() > pd.Timestamp("2007-01-31"):
-                st.error("本地資料庫缺少2007–2009年TAIEX。請到「⑥ 資料管理」按『補齊1999年至今官方TAIEX』。")
+                st.error("本地資料庫缺少2007–2009年TAIEX。請到「⑦ 資料管理」按『補齊1999年至今官方TAIEX』。")
                 st.stop()
             ur = base.pct_change().dropna()
             br = ur.copy()
@@ -1624,6 +2348,59 @@ with tabs[4]:
                 key="ladder_exit_style"
             )
 
+        st.markdown("#### Fear & Greed 加碼倍率（可選）")
+        use_fng_ladder = st.checkbox(
+            "使用前一個已知 CNN Fear & Greed 調整每階加碼金額",
+            value=False,
+            key="ladder_use_fng"
+        )
+
+        fng_mults = {
+            "extreme fear": 1.0,
+            "fear": 1.0,
+            "neutral": 1.0,
+            "greed": 1.0,
+            "extreme greed": 1.0,
+        }
+
+        if use_fng_ladder:
+            if fng_db.empty:
+                st.warning(
+                    "Fear & Greed 本地資料庫尚未建立。"
+                    "請先到「⑦ 資料管理」按『建立／更新 Fear & Greed』。"
+                )
+            else:
+                m1, m2, m3, m4, m5 = st.columns(5)
+                with m1:
+                    fng_mults["extreme fear"] = st.number_input(
+                        "極度恐懼 <25", 0.0, 3.0, 1.50, 0.10,
+                        key="fng_mult_ef"
+                    )
+                with m2:
+                    fng_mults["fear"] = st.number_input(
+                        "恐懼 25–44", 0.0, 3.0, 1.20, 0.10,
+                        key="fng_mult_f"
+                    )
+                with m3:
+                    fng_mults["neutral"] = st.number_input(
+                        "中性 45–54", 0.0, 3.0, 1.00, 0.10,
+                        key="fng_mult_n"
+                    )
+                with m4:
+                    fng_mults["greed"] = st.number_input(
+                        "貪婪 55–74", 0.0, 3.0, 0.70, 0.10,
+                        key="fng_mult_g"
+                    )
+                with m5:
+                    fng_mults["extreme greed"] = st.number_input(
+                        "極度貪婪 ≥75", 0.0, 3.0, 0.50, 0.10,
+                        key="fng_mult_eg"
+                    )
+                st.caption(
+                    "時間對齊採嚴格前一個已知美國交易日；"
+                    "台灣同日尚未公布的美國收盤F&G不會被使用。"
+                )
+
         rebound_start_pct = 20
         rebound_step_pct = 10
         sell_step_pct = 5
@@ -1683,7 +2460,7 @@ with tabs[4]:
                 "2000-01-01":"2002-12-31"
             ].dropna()
             if mkt.empty or mkt.index.min() > pd.Timestamp("2000-01-31"):
-                st.error("缺少2000年官方TAIEX，請先到「⑥ 資料管理」補齊。")
+                st.error("缺少2000年官方TAIEX，請先到「⑦ 資料管理」補齊。")
                 st.stop()
             uret = mkt.pct_change().fillna(0)
             lev_ret_ladder = synthetic_2x_returns(
@@ -1699,7 +2476,7 @@ with tabs[4]:
                 "2007-01-01":"2009-12-31"
             ].dropna()
             if mkt.empty or mkt.index.min() > pd.Timestamp("2007-01-31"):
-                st.error("缺少2007–2009官方TAIEX，請先到「⑥ 資料管理」補齊。")
+                st.error("缺少2007–2009官方TAIEX，請先到「⑦ 資料管理」補齊。")
                 st.stop()
             uret = mkt.pct_change().fillna(0)
             lev_ret_ladder = synthetic_2x_returns(
@@ -1711,6 +2488,13 @@ with tabs[4]:
             data_note = "2008年沒有00631L，使用官方TAIEX＋2014年至今正2偏差模型。"
 
         st.info(data_note)
+
+        ladder_fng_signal = None
+        if use_fng_ladder and not fng_db.empty:
+            aligned_ladder_fng = align_fng_to_taiwan_dates(
+                market_level_ladder.index, fng_db
+            )
+            ladder_fng_signal = aligned_ladder_fng["FearGreed"]
 
         ladder_df, ladder_events, ladder_stats = simulate_ladder_buy_strategy(
             lev_ret=lev_ret_ladder,
@@ -1728,6 +2512,8 @@ with tabs[4]:
             cash_yield=cash_yield,
             buy_cost=buy_cost,
             sell_cost=sell_cost,
+            fng_signal=ladder_fng_signal,
+            fng_multipliers=fng_mults,
         )
 
         bench_ladder = simulate_benchmark(
@@ -1774,10 +2560,17 @@ with tabs[4]:
                 f"{pd.Timestamp(ladder_stats['首次現金用完日期']).date()}"
             )
 
-        st.line_chart(pd.concat([
-            bench_ladder["Portfolio"].rename(benchmark_name),
-            ladder_df["Portfolio"].rename("越跌越買策略"),
-        ], axis=1))
+        st.subheader("互動資產走勢與日期查詢")
+        render_portfolio_chart(
+            strategy_df=ladder_df,
+            benchmark_series=bench_ladder["Portfolio"],
+            benchmark_name=benchmark_name,
+            strategy_name="越跌越買策略",
+            initial_capital=capital,
+            key_prefix="ladder_portfolio",
+            default_query_date=ladder_df.index.min(),
+            event_df=ladder_events,
+        )
 
         st.caption("投資組合回撤")
         st.line_chart(pd.concat([
@@ -1805,8 +2598,13 @@ with tabs[4]:
                         "Drawdown": "{:.2%}",
                         "ReboundFromLow": "{:.2%}",
                         "Trigger": "{:.2%}",
+                        "FNG": "{:.1f}",
+                        "FNGMultiplier": "{:.2f}×",
+                        "BaseAmount": "{:,.0f}",
                         "Amount": "{:,.0f}",
                         "Cost": "{:,.0f}",
+                        "LevBefore": "{:,.0f}",
+                        "CashBefore": "{:,.0f}",
                         "CashAfter": "{:,.0f}",
                         "LevAfter": "{:,.0f}",
                     }, na_rep=""),
@@ -1822,9 +2620,18 @@ with tabs[4]:
                 f"之後每再跌 {ladder_dd_step_pct}% 再加碼。"
             )
             st.write(
-                f"每階投入：{ladder_buy_pct}% × {ladder_buy_basis}；"
+                f"每階基本投入：{ladder_buy_pct}% × {ladder_buy_basis}；"
                 "現金可用到 0，但不使用融資。"
             )
+            if use_fng_ladder:
+                st.write(
+                    "Fear & Greed倍率："
+                    f"極度恐懼 {fng_mults['extreme fear']:.2f}×、"
+                    f"恐懼 {fng_mults['fear']:.2f}×、"
+                    f"中性 {fng_mults['neutral']:.2f}×、"
+                    f"貪婪 {fng_mults['greed']:.2f}×、"
+                    f"極度貪婪 {fng_mults['extreme greed']:.2f}×。"
+                )
             if ladder_exit_style == "回到前高一次再平衡":
                 st.write("反彈：回到本輪下跌前高時，一次恢復原始配置。")
             elif ladder_exit_style == "低點反彈指定幅度一次再平衡":
@@ -1844,9 +2651,139 @@ with tabs[4]:
 
 
 # ----------------------------
-# ⑥ 資料管理
+# ⑥ Fear & Greed 研究
 # ----------------------------
 with tabs[5]:
+    st.subheader("CNN Fear & Greed｜台灣市場研究")
+
+    if fng_db.empty:
+        st.warning(
+            "Fear & Greed 資料庫尚未建立。請到「⑦ 資料管理」"
+            "按『建立／更新 Fear & Greed』。"
+        )
+    else:
+        fng_start = fng_db["Date"].min()
+        fng_end = fng_db["Date"].max()
+        reconstructed_n = int((fng_db["Source"] == "reconstructed").sum())
+        cnn_n = int((fng_db["Source"] == "cnn_official_via_mirror").sum())
+
+        a, b, c, d = st.columns(4)
+        a.metric("最早日期", f"{fng_start.date()}")
+        b.metric("最新日期", f"{fng_end.date()}")
+        c.metric("第三方重建筆數", f"{reconstructed_n:,}")
+        d.metric("CNN端點尾端筆數", f"{cnn_n:,}")
+
+        st.info(
+            "2011/01/03–2021/01/29 標為第三方歷史重建；"
+            "2021/02/01之後的 canonical dataset 由維護專案"
+            "從 CNN 現行端點更新。"
+        )
+
+        chart_df = fng_db.set_index("Date")[["FearGreed"]].rename(
+            columns={"FearGreed": "Fear & Greed"}
+        )
+        st.line_chart(chart_df)
+
+        if has_required_data:
+            st.markdown("### Fear & Greed 與台股後續報酬")
+            market_choice = st.radio(
+                "台股研究標的",
+                ["TAIEX", "0050"],
+                horizontal=True,
+                key="fng_market_choice"
+            )
+
+            if market_choice == "TAIEX":
+                mkt_series = actual["twii"]["Close"].dropna()
+            else:
+                mkt_series = actual["tr0050"].dropna()
+
+            aligned = align_fng_to_taiwan_dates(mkt_series.index, fng_db)
+            study = pd.DataFrame(index=mkt_series.index)
+            study["Market"] = mkt_series
+            study = study.join(
+                aligned[["FNGDate", "FearGreed", "Rating", "Source"]],
+                how="left"
+            )
+
+            for h in [20, 60, 120]:
+                study[f"Fwd{h}"] = study["Market"].shift(-h) / study["Market"] - 1
+
+            def band_from_score(s):
+                if pd.isna(s):
+                    return np.nan
+                if s < 25:
+                    return "0–24 極度恐懼"
+                if s < 45:
+                    return "25–44 恐懼"
+                if s < 55:
+                    return "45–54 中性"
+                if s < 75:
+                    return "55–74 貪婪"
+                return "75–100 極度貪婪"
+
+            study["Band"] = study["FearGreed"].apply(band_from_score)
+            ordered_bands = [
+                "0–24 極度恐懼",
+                "25–44 恐懼",
+                "45–54 中性",
+                "55–74 貪婪",
+                "75–100 極度貪婪",
+            ]
+            grouped = study.dropna(subset=["Band"]).groupby("Band").agg(
+                樣本數=("FearGreed", "size"),
+                FNG平均=("FearGreed", "mean"),
+                後20日平均=("Fwd20", "mean"),
+                後20日中位數=("Fwd20", "median"),
+                後60日平均=("Fwd60", "mean"),
+                後60日中位數=("Fwd60", "median"),
+                後120日平均=("Fwd120", "mean"),
+                後120日中位數=("Fwd120", "median"),
+            ).reindex(ordered_bands)
+
+            st.dataframe(
+                grouped.style.format({
+                    "樣本數": "{:,.0f}",
+                    "FNG平均": "{:.1f}",
+                    "後20日平均": "{:.2%}",
+                    "後20日中位數": "{:.2%}",
+                    "後60日平均": "{:.2%}",
+                    "後60日中位數": "{:.2%}",
+                    "後120日平均": "{:.2%}",
+                    "後120日中位數": "{:.2%}",
+                }),
+                use_container_width=True
+            )
+
+            st.caption(
+                "時間對齊已避免前視偏誤：台灣每個交易日只使用嚴格早於"
+                "該日期的最新美國 Fear & Greed。此表是相關性研究，不代表因果。"
+            )
+
+            st.markdown("### 資料來源分段比較")
+            source_group = study.dropna(subset=["FearGreed"]).groupby("Source").agg(
+                樣本數=("FearGreed", "size"),
+                FNG平均=("FearGreed", "mean"),
+                後20日平均=("Fwd20", "mean"),
+                後60日平均=("Fwd60", "mean"),
+                後120日平均=("Fwd120", "mean"),
+            )
+            st.dataframe(
+                source_group.style.format({
+                    "樣本數": "{:,.0f}",
+                    "FNG平均": "{:.1f}",
+                    "後20日平均": "{:.2%}",
+                    "後60日平均": "{:.2%}",
+                    "後120日平均": "{:.2%}",
+                }),
+                use_container_width=True
+            )
+
+
+# ----------------------------
+# ⑦ 資料管理
+# ----------------------------
+with tabs[6]:
     st.subheader("本地市場資料庫")
     st.write(
         "一般回測只讀取 GitHub 專案內的 `data/market_daily.csv`。"
@@ -1952,6 +2889,80 @@ with tabs[5]:
         )
 
     st.divider()
+    st.markdown("### CNN Fear & Greed 資料庫")
+
+    if fng_db.empty:
+        st.warning("目前 fear_greed_daily.csv 尚未建立資料。")
+    else:
+        fs = fng_db["Date"].min()
+        fe = fng_db["Date"].max()
+        st.success(
+            f"Fear & Greed：{fs.date()} ～ {fe.date()}，"
+            f"共 {len(fng_db):,} 筆。"
+        )
+        st.dataframe(
+            fng_db.groupby("Source").agg(
+                起始日=("Date", "min"),
+                最後日=("Date", "max"),
+                筆數=("Date", "size"),
+            ),
+            use_container_width=True
+        )
+
+    if st.button("建立／更新 Fear & Greed", type="secondary"):
+        try:
+            with st.spinner("下載 Fear & Greed canonical dataset…"):
+                fresh_fng = download_fng_combined()
+                save_local_fng(fresh_fng)
+            st.success(
+                f"Fear & Greed 已更新：{fresh_fng['Date'].min().date()} ～ "
+                f"{fresh_fng['Date'].max().date()}，共 {len(fresh_fng):,} 筆。"
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"Fear & Greed 更新失敗：{e}")
+
+    fng_upload = st.file_uploader(
+        "匯入 fear_greed_daily.csv",
+        type=["csv"],
+        key="fng_upload"
+    )
+    if fng_upload is not None:
+        try:
+            incoming_fng = pd.read_csv(fng_upload)
+            if st.button("確認匯入 Fear & Greed"):
+                incoming_fng = incoming_fng.rename(columns={
+                    "Fear Greed": "FearGreed",
+                    "date": "Date",
+                    "rating": "Rating",
+                    "source": "Source",
+                })
+                save_local_fng(incoming_fng)
+                st.success("Fear & Greed 已匯入。")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Fear & Greed 匯入失敗：{e}")
+
+    if not fng_db.empty:
+        fng_export = fng_db.copy()
+        fng_export["Date"] = pd.to_datetime(
+            fng_export["Date"]
+        ).dt.strftime("%Y-%m-%d")
+        fng_bytes = fng_export.to_csv(
+            index=False
+        ).encode("utf-8-sig")
+        st.download_button(
+            "下載最新版 fear_greed_daily.csv",
+            data=fng_bytes,
+            file_name="fear_greed_daily.csv",
+            mime="text/csv",
+        )
+        st.info(
+            "和 market_daily.csv 一樣，網站更新後請把 fear_greed_daily.csv "
+            "覆蓋回 GitHub 的 data/ 目錄，才能永久保存。"
+        )
+
+    st.divider()
     st.markdown("#### 資料安全檢查")
     if not db.empty:
         dup = db.duplicated(["Date", "Symbol"]).sum()
@@ -1964,6 +2975,6 @@ with tabs[5]:
 
 st.divider()
 st.caption(
-    "v1.5：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
+    "v1.8：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
     "歷史回測與模型最佳化均不代表未來報酬。"
 )

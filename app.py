@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="台灣50正2再平衡模擬器 v1.9", layout="wide")
+st.set_page_config(page_title="台灣50正2再平衡模擬器 v2.0", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -1852,12 +1852,139 @@ def render_minimum_position_stats(strategy_df, title="投資期間最低資產�
     g.metric("現金歷史最低", f"{stats['最低現金']:,.0f} 元")
     h.metric("現金最低日期", stats["最低現金日期"].strftime("%Y/%m/%d"))
 
+
+# ============================================================
+# Fear & Greed 區間轉換研究
+# ============================================================
+def build_fng_transition_events(study, ordered_bands):
+    """
+    只記錄 F&G 區間真正改變的台灣交易日。
+    例如 Fear -> Neutral 記一筆；
+    Neutral -> Neutral 不重複記錄。
+    """
+    x = study.copy()
+    x["FromBand"] = x["Band"].shift(1)
+    x["ToBand"] = x["Band"]
+
+    valid = (
+        x["FromBand"].notna()
+        & x["ToBand"].notna()
+        & (x["FromBand"] != x["ToBand"])
+    )
+    ev = x.loc[valid].copy()
+
+    order_map = {band: i for i, band in enumerate(ordered_bands)}
+    ev["FromOrder"] = ev["FromBand"].map(order_map)
+    ev["ToOrder"] = ev["ToBand"].map(order_map)
+    ev["Direction"] = np.where(
+        ev["ToOrder"] > ev["FromOrder"],
+        "情緒改善（往貪婪）",
+        "情緒惡化（往恐懼）"
+    )
+    ev["Transition"] = ev["FromBand"] + " → " + ev["ToBand"]
+
+    # F&G 在台灣可用的實際來源日，有助於檢查時間對齊
+    if "FNGDate" in ev.columns:
+        ev["FNGDate"] = pd.to_datetime(ev["FNGDate"], errors="coerce")
+
+    return ev
+
+
+def summarize_fng_transitions(events, ordered_bands):
+    """統計所有 From -> To 組合的未來報酬與勝率。"""
+    if events is None or events.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (from_band, to_band), g in events.groupby(["FromBand", "ToBand"], observed=False):
+        row = {
+            "FromBand": from_band,
+            "ToBand": to_band,
+            "Transition": f"{from_band} → {to_band}",
+            "方向": g["Direction"].iloc[0] if "Direction" in g.columns else "",
+            "樣本數": len(g),
+            "FNG進入值平均": g["FearGreed"].mean(),
+        }
+
+        for h in [5, 20, 60, 120]:
+            col = f"Fwd{h}"
+            if col in g.columns:
+                vals = pd.to_numeric(g[col], errors="coerce").dropna()
+                row[f"後{h}日平均"] = vals.mean() if len(vals) else np.nan
+                row[f"後{h}日中位數"] = vals.median() if len(vals) else np.nan
+                row[f"後{h}日上漲率"] = (vals > 0).mean() if len(vals) else np.nan
+                row[f"後{h}日有效樣本"] = len(vals)
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+
+    order_map = {band: i for i, band in enumerate(ordered_bands)}
+    out["_from_order"] = out["FromBand"].map(order_map)
+    out["_to_order"] = out["ToBand"].map(order_map)
+    out = out.sort_values(["_from_order", "_to_order"]).drop(
+        columns=["_from_order", "_to_order"]
+    )
+    return out.reset_index(drop=True)
+
+
+def transition_matrix(summary, ordered_bands, metric):
+    """將轉換摘要轉成 5x5 matrix。"""
+    if summary is None or summary.empty or metric not in summary.columns:
+        return pd.DataFrame(index=ordered_bands, columns=ordered_bands, dtype=float)
+
+    mat = summary.pivot(index="FromBand", columns="ToBand", values=metric)
+    return mat.reindex(index=ordered_bands, columns=ordered_bands)
+
+
+def render_transition_heatmap(matrix_df, metric, key):
+    """Plotly 5x5 heatmap；對角線因未計同區間停留而保持空白。"""
+    if matrix_df.empty:
+        st.info("目前沒有可顯示的轉換資料。")
+        return
+
+    z = matrix_df.astype(float).values
+
+    if metric == "樣本數":
+        texttemplate = "%{z:.0f}"
+        hover_value = "%{z:.0f}"
+    elif "FNG" in metric:
+        texttemplate = "%{z:.1f}"
+        hover_value = "%{z:.1f}"
+    else:
+        # 報酬、勝率皆以百分比呈現
+        z = z * 100
+        texttemplate = "%{z:.1f}%"
+        hover_value = "%{z:.2f}%"
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=list(matrix_df.columns),
+        y=list(matrix_df.index),
+        texttemplate=texttemplate,
+        hovertemplate=(
+            "來源：%{y}<br>"
+            "進入：%{x}<br>"
+            + metric + "：" + hover_value +
+            "<extra></extra>"
+        ),
+        colorbar=dict(title=metric),
+    ))
+    fig.update_layout(
+        height=520,
+        xaxis_title="進入哪個區間（To）",
+        yaxis_title="由哪個區間進入（From）",
+        margin=dict(l=10, r=10, t=30, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
+
 # ============================================================
 # UI
 # ============================================================
-st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v1.9")
+st.title("台灣50正2 × 現金：再平衡與股災壓力測試模擬器 v2.0")
 st.caption(
-    "v1.9：新增投資期間最低資產統計；可查看最低總資產時的正2／現金，"
+    "v2.0：新增投資期間最低資產統計；可查看最低總資產時的正2／現金，"
     "以及正2與現金各自的歷史最低值與日期。"
 )
 
@@ -2770,7 +2897,7 @@ with tabs[5]:
                 how="left"
             )
 
-            for h in [20, 60, 120]:
+            for h in [5, 20, 60, 120]:
                 study[f"Fwd{h}"] = study["Market"].shift(-h) / study["Market"] - 1
 
             def band_from_score(s):
@@ -2797,6 +2924,8 @@ with tabs[5]:
             grouped = study.dropna(subset=["Band"]).groupby("Band").agg(
                 樣本數=("FearGreed", "size"),
                 FNG平均=("FearGreed", "mean"),
+                後5日平均=("Fwd5", "mean"),
+                後5日中位數=("Fwd5", "median"),
                 後20日平均=("Fwd20", "mean"),
                 後20日中位數=("Fwd20", "median"),
                 後60日平均=("Fwd60", "mean"),
@@ -2809,6 +2938,8 @@ with tabs[5]:
                 grouped.style.format({
                     "樣本數": "{:,.0f}",
                     "FNG平均": "{:.1f}",
+                    "後5日平均": "{:.2%}",
+                    "後5日中位數": "{:.2%}",
                     "後20日平均": "{:.2%}",
                     "後20日中位數": "{:.2%}",
                     "後60日平均": "{:.2%}",
@@ -2824,10 +2955,235 @@ with tabs[5]:
                 "該日期的最新美國 Fear & Greed。此表是相關性研究，不代表因果。"
             )
 
+
+            st.divider()
+            st.markdown("### F&G 五區間「跨區間轉換」研究")
+            st.write(
+                "這裡只計算真正跨區間的交易日。例如 Fear → Neutral 記一筆；"
+                "之後若連續多日都在 Neutral，不會重複計算。"
+                "因此可直接比較『從 Fear 進 Neutral』和『從 Greed 進 Neutral』後，"
+                "台股後續表現是否不同。"
+            )
+
+            transition_events_all = build_fng_transition_events(
+                study, ordered_bands
+            )
+
+            tc1, tc2, tc3 = st.columns([1.2, 1.2, 1.0])
+            with tc1:
+                transition_source_filter = st.selectbox(
+                    "F&G資料來源",
+                    [
+                        "全部（2011年至今）",
+                        "僅第三方重建（至2021/01）",
+                        "僅CNN端點尾端（2021/02後）",
+                    ],
+                    key="fng_transition_source"
+                )
+            with tc2:
+                min_transition_samples = st.number_input(
+                    "詳細比較最低樣本數",
+                    min_value=1,
+                    max_value=100,
+                    value=3,
+                    step=1,
+                    key="fng_transition_min_samples"
+                )
+            with tc3:
+                matrix_metric = st.selectbox(
+                    "5×5矩陣顯示",
+                    [
+                        "樣本數",
+                        "後5日平均",
+                        "後20日平均",
+                        "後60日平均",
+                        "後120日平均",
+                        "後20日上漲率",
+                        "後60日上漲率",
+                        "後120日上漲率",
+                    ],
+                    key="fng_transition_matrix_metric"
+                )
+
+            transition_events = transition_events_all.copy()
+
+            if transition_source_filter.startswith("僅第三方"):
+                transition_events = transition_events.loc[
+                    transition_events["Source"] == "reconstructed"
+                ].copy()
+            elif transition_source_filter.startswith("僅CNN"):
+                transition_events = transition_events.loc[
+                    transition_events["Source"] == "cnn_official_via_mirror"
+                ].copy()
+
+            transition_summary = summarize_fng_transitions(
+                transition_events, ordered_bands
+            )
+
+            if transition_summary.empty:
+                st.warning("目前篩選條件下沒有跨區間事件。")
+            else:
+                total_events = len(transition_events)
+                combo_count = int(
+                    transition_summary[["FromBand", "ToBand"]]
+                    .drop_duplicates()
+                    .shape[0]
+                )
+                improving_n = int(
+                    (transition_events["Direction"] == "情緒改善（往貪婪）").sum()
+                )
+                worsening_n = int(
+                    (transition_events["Direction"] == "情緒惡化（往恐懼）").sum()
+                )
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("跨區間事件數", f"{total_events:,}")
+                m2.metric("實際出現組合", f"{combo_count} / 20")
+                m3.metric("往貪婪方向", f"{improving_n:,}")
+                m4.metric("往恐懼方向", f"{worsening_n:,}")
+
+                matrix_df = transition_matrix(
+                    transition_summary, ordered_bands, matrix_metric
+                )
+                render_transition_heatmap(
+                    matrix_df,
+                    matrix_metric,
+                    key="fng_transition_matrix"
+                )
+
+                st.caption(
+                    "列＝原本區間；欄＝新進入區間。對角線為空白，因為同區間停留"
+                    "不屬於『轉換事件』。直接跨兩級以上（例如 Extreme Fear → Neutral）"
+                    "會依實際觀測保留，不強迫拆成中間區間。"
+                )
+
+                st.markdown("#### 20種可能轉換的詳細統計")
+                detail = transition_summary.loc[
+                    transition_summary["樣本數"] >= int(min_transition_samples)
+                ].copy()
+
+                detail_cols = [
+                    "Transition", "方向", "樣本數", "FNG進入值平均",
+                    "後5日平均", "後5日中位數", "後5日上漲率",
+                    "後20日平均", "後20日中位數", "後20日上漲率",
+                    "後60日平均", "後60日中位數", "後60日上漲率",
+                    "後120日平均", "後120日中位數", "後120日上漲率",
+                ]
+                detail_cols = [c for c in detail_cols if c in detail.columns]
+
+                st.dataframe(
+                    detail[detail_cols].style.format({
+                        "樣本數": "{:,.0f}",
+                        "FNG進入值平均": "{:.1f}",
+                        "後5日平均": "{:.2%}",
+                        "後5日中位數": "{:.2%}",
+                        "後5日上漲率": "{:.1%}",
+                        "後20日平均": "{:.2%}",
+                        "後20日中位數": "{:.2%}",
+                        "後20日上漲率": "{:.1%}",
+                        "後60日平均": "{:.2%}",
+                        "後60日中位數": "{:.2%}",
+                        "後60日上漲率": "{:.1%}",
+                        "後120日平均": "{:.2%}",
+                        "後120日中位數": "{:.2%}",
+                        "後120日上漲率": "{:.1%}",
+                    }, na_rep=""),
+                    use_container_width=True,
+                    height=560,
+                )
+
+                st.markdown("#### 指定『進入區間』：比較它是從哪裡來")
+                destination_band = st.selectbox(
+                    "進入區間（To）",
+                    ordered_bands,
+                    index=2,
+                    key="fng_transition_destination"
+                )
+                destination_compare = transition_summary.loc[
+                    (transition_summary["ToBand"] == destination_band)
+                    & (transition_summary["樣本數"] >= int(min_transition_samples))
+                ].copy()
+
+                if destination_compare.empty:
+                    st.info(
+                        f"目前沒有樣本數達 {min_transition_samples} 筆的"
+                        f"「進入 {destination_band}」轉換。"
+                    )
+                else:
+                    compare_cols = [
+                        "FromBand", "樣本數",
+                        "後5日平均", "後20日平均",
+                        "後60日平均", "後120日平均",
+                        "後20日上漲率", "後60日上漲率", "後120日上漲率"
+                    ]
+                    compare_cols = [
+                        c for c in compare_cols if c in destination_compare.columns
+                    ]
+                    st.dataframe(
+                        destination_compare[compare_cols].style.format({
+                            "樣本數": "{:,.0f}",
+                            "後5日平均": "{:.2%}",
+                            "後20日平均": "{:.2%}",
+                            "後60日平均": "{:.2%}",
+                            "後120日平均": "{:.2%}",
+                            "後20日上漲率": "{:.1%}",
+                            "後60日上漲率": "{:.1%}",
+                            "後120日上漲率": "{:.1%}",
+                        }, na_rep=""),
+                        use_container_width=True
+                    )
+
+                st.markdown("#### 查某一種轉換的實際發生日")
+                transition_options = transition_summary["Transition"].tolist()
+                selected_transition = st.selectbox(
+                    "轉換組合",
+                    transition_options,
+                    key="fng_transition_event_choice"
+                )
+                selected_events = transition_events.loc[
+                    transition_events["Transition"] == selected_transition,
+                    [
+                        "FNGDate", "FearGreed", "Source", "Direction",
+                        "Market", "Fwd5", "Fwd20", "Fwd60", "Fwd120"
+                    ]
+                ].copy()
+
+                selected_events = selected_events.rename(columns={
+                    "FNGDate": "使用的F&G來源日",
+                    "FearGreed": "進入後F&G",
+                    "Source": "資料來源",
+                    "Direction": "方向",
+                    "Market": "台股當日值",
+                    "Fwd5": "後5日",
+                    "Fwd20": "後20日",
+                    "Fwd60": "後60日",
+                    "Fwd120": "後120日",
+                })
+
+                st.dataframe(
+                    selected_events.style.format({
+                        "進入後F&G": "{:.1f}",
+                        "台股當日值": "{:,.2f}",
+                        "後5日": "{:.2%}",
+                        "後20日": "{:.2%}",
+                        "後60日": "{:.2%}",
+                        "後120日": "{:.2%}",
+                    }, na_rep=""),
+                    use_container_width=True,
+                    height=420
+                )
+
+                st.warning(
+                    "轉換研究的樣本數會比單純『所在區間』少很多；"
+                    "20種可能組合再同時看多個持有期間，容易出現偶然的漂亮數字。"
+                    "判讀時請至少同時看樣本數、中位數與上漲率，不要只看平均報酬。"
+                )
+
             st.markdown("### 資料來源分段比較")
             source_group = study.dropna(subset=["FearGreed"]).groupby("Source").agg(
                 樣本數=("FearGreed", "size"),
                 FNG平均=("FearGreed", "mean"),
+                後5日平均=("Fwd5", "mean"),
                 後20日平均=("Fwd20", "mean"),
                 後60日平均=("Fwd60", "mean"),
                 後120日平均=("Fwd120", "mean"),
@@ -2836,6 +3192,7 @@ with tabs[5]:
                 source_group.style.format({
                     "樣本數": "{:,.0f}",
                     "FNG平均": "{:.1f}",
+                    "後5日平均": "{:.2%}",
                     "後20日平均": "{:.2%}",
                     "後60日平均": "{:.2%}",
                     "後120日平均": "{:.2%}",
@@ -3039,6 +3396,6 @@ with tabs[6]:
 
 st.divider()
 st.caption(
-    "v1.9：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
+    "v2.0：新增1999年至今長期模擬回測與可調投資開始日期；越跌越買與反彈分批減碼功能仍保留。"
     "歷史回測與模型最佳化均不代表未來報酬。"
 )

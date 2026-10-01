@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# V3.6.62：刪除圖形改為批次勾選；按「完成刪除」後才一次同步草稿。
+# V3.6.61：工程／治理圖資完成編輯動作後，精確維持瀏覽器原本的頁面捲動位置。
 # V3.6.60：治理現況底圖允許藍色「未指定現況」線先行儲存，後續再補登治理狀態。
 # V3.6.59：修正 st_folium 重繪後整個 Streamlit 頁面往上捲動；改用地圖錨點恢復頁面位置。
 # V3.6.58：總覽顯示設定／縮放線寬與各 GIS 圖台視角保持；暫時隱藏 PNG 輸出。
@@ -10322,11 +10324,12 @@ def _render_draft_controls(key: str) -> None:
 
 
 class BrowserViewportMemory(MacroElement):
-    """V3.6.59：同時記住地圖視角及該地圖在 Streamlit 頁面的可視位置。
+    """V3.6.61：同時記住地圖視角及該地圖在 Streamlit 頁面的精確位置。
 
     必須先恢復再掛上 moveend 監聽，否則地圖重建時的初始 fitBounds 可能反過來
-    覆蓋使用者剛才的視角。點選標記與繪圖事件會在 Streamlit rerun 前，同步保存
-    iframe 相對於瀏覽器視窗的位置，重建後據此恢復整個頁面的垂直捲動位置。
+    覆蓋使用者剛才的視角。新版不再假設整頁由 window 捲動，而是找出 iframe
+    所在的 Streamlit 實際捲動容器；繪圖事件前同時保存 scrollTop 與 iframe top，
+    地圖重建後反算並恢復，讓瀏覽器畫面停在操作前的同一位置。
     """
 
     _template = Template(r"""
@@ -10340,6 +10343,60 @@ class BrowserViewportMemory(MacroElement):
             try { if (window.parent && window.parent.sessionStorage) return window.parent.sessionStorage; } catch(e) {}
             return window.sessionStorage;
         }
+        function isDocumentRoot(el) {
+            try {
+                var d = window.parent.document;
+                return !el || el === d.scrollingElement || el === d.documentElement || el === d.body;
+            } catch(e) { return true; }
+        }
+        function canScroll(el) {
+            if (!el) return false;
+            try {
+                if (Number(el.scrollHeight || 0) <= Number(el.clientHeight || 0) + 2) return false;
+                if (isDocumentRoot(el)) return true;
+                var style = window.parent.getComputedStyle(el);
+                return /(auto|scroll|overlay)/.test(String(style && style.overflowY || ''));
+            } catch(e) { return false; }
+        }
+        function findScrollRoot() {
+            var p = window.parent, d = p.document;
+            try {
+                var frame = window.frameElement;
+                var node = frame ? frame.parentElement : null;
+                while (node) {
+                    if (canScroll(node)) return node;
+                    node = node.parentElement;
+                }
+                var selectors = ['[data-testid="stMain"]', 'section.main', '[data-testid="stAppViewContainer"]'];
+                for (var i = 0; i < selectors.length; i++) {
+                    var candidate = d.querySelector(selectors[i]);
+                    if (canScroll(candidate)) return candidate;
+                }
+            } catch(e) {}
+            return d.scrollingElement || d.documentElement || d.body;
+        }
+        function rootScrollTop(root) {
+            try {
+                if (!isDocumentRoot(root)) return Number(root.scrollTop || 0);
+                var elementTop = Number(root && root.scrollTop || 0);
+                var windowTop = Number(window.parent.scrollY || window.parent.pageYOffset || 0);
+                return Math.abs(elementTop) >= Math.abs(windowTop) ? elementTop : windowTop;
+            } catch(e) { return 0; }
+        }
+        function setRootScrollTop(root, value) {
+            var target = Math.max(0, Number(value || 0));
+            try {
+                if (!isDocumentRoot(root)) {
+                    try { root.scrollTo({top:target, left:0, behavior:'auto'}); }
+                    catch(e) { root.scrollTop = target; }
+                    return;
+                }
+                var p = window.parent;
+                try { p.scrollTo({top:target, left:0, behavior:'auto'}); }
+                catch(e) { try { p.scrollTo(0, target); } catch(_e) {} }
+                try { if (root) root.scrollTop = target; } catch(e) {}
+            } catch(e) {}
+        }
         function safeGet() {
             try {
                 var raw = storageObj().getItem(storageKey);
@@ -10351,9 +10408,9 @@ class BrowserViewportMemory(MacroElement):
         }
         function pageSnapshot() {
             try {
-                var p = window.parent;
+                var root = findScrollRoot();
                 var frame = window.frameElement;
-                var y = Number(p.scrollY || p.pageYOffset || 0);
+                var y = rootScrollTop(root);
                 var top = frame ? Number(frame.getBoundingClientRect().top) : NaN;
                 return {
                     page_y: isFinite(y) ? y : 0,
@@ -10365,15 +10422,17 @@ class BrowserViewportMemory(MacroElement):
             try {
                 var c = mapObj.getCenter(), z = mapObj.getZoom();
                 var page = pageSnapshot();
+                var now = Date.now();
                 var payload = {
-                    lat:Number(c.lat), lng:Number(c.lng), zoom:Number(z), ts:Date.now(),
-                    page_y:Number(page.page_y), frame_top:page.frame_top
+                    lat:Number(c.lat), lng:Number(c.lng), zoom:Number(z), ts:now,
+                    page_y:Number(page.page_y), frame_top:page.frame_top,
+                    page_intent_ts:(markPageIntent === true ? now : 0)
                 };
                 storageObj().setItem(storageKey, JSON.stringify(payload));
                 if (markPageIntent === true) {
                     storageObj().setItem(pageIntentKey, JSON.stringify({
                         y:Number(page.page_y), frame_top:page.frame_top,
-                        view_key:storageKey, source:'folium-map', ts:Date.now()
+                        view_key:storageKey, source:'folium-map', ts:now
                     }));
                     try {
                         storageObj().setItem('wra_gis_page_scroll_v3659', JSON.stringify({
@@ -10387,16 +10446,30 @@ class BrowserViewportMemory(MacroElement):
             try {
                 var raw = storageObj().getItem(pageIntentKey);
                 var obj = raw ? JSON.parse(raw) : null;
-                if (!obj || obj.view_key !== storageKey || !isFinite(obj.y) ||
-                    !isFinite(obj.ts) || Date.now()-Number(obj.ts) >= 8000) return null;
-                return obj;
-            } catch(e) { return null; }
+                if (obj && obj.view_key === storageKey && isFinite(obj.y) &&
+                    isFinite(obj.ts) && Date.now()-Number(obj.ts) < 30000) return obj;
+            } catch(e) {}
+            // GIS 主流程在重建較重的 Folium 地圖時，可能先清除全頁 intent。
+            // 仍可使用這張地圖自己保存的近期快照，不讓數秒載入時間吃掉定位資料。
+            try {
+                var saved = safeGet();
+                var intentTs = Number(saved && saved.page_intent_ts || 0);
+                if (saved && isFinite(saved.page_y) && saved.frame_top !== null &&
+                    isFinite(saved.frame_top) && isFinite(intentTs) && intentTs > 0 &&
+                    Date.now()-intentTs < 30000) {
+                    return {
+                        y:Number(saved.page_y), frame_top:Number(saved.frame_top),
+                        view_key:storageKey, source:'folium-map-snapshot', ts:intentTs
+                    };
+                }
+            } catch(e) {}
+            return null;
         }
         var pageRestoreScheduled = false;
         function restorePageOnce(intent) {
             try {
-                var p = window.parent;
-                var currentY = Number(p.scrollY || p.pageYOffset || 0);
+                var root = findScrollRoot();
+                var currentY = rootScrollTop(root);
                 var targetY = Number(intent.y);
                 var frame = window.frameElement;
                 if (frame && intent.frame_top !== null && isFinite(intent.frame_top)) {
@@ -10406,8 +10479,7 @@ class BrowserViewportMemory(MacroElement):
                     }
                 }
                 targetY = Math.max(0, targetY);
-                try { p.scrollTo({top:targetY,left:0,behavior:'auto'}); }
-                catch(e) { try { p.scrollTo(0,targetY); } catch(_e) {} }
+                setRootScrollTop(root, targetY);
             } catch(e) {}
         }
         function schedulePageRestore() {
@@ -10415,7 +10487,7 @@ class BrowserViewportMemory(MacroElement):
             var intent = readPageIntent();
             if (!intent) return false;
             pageRestoreScheduled = true;
-            [0,70,220,500,900,1450,2050].forEach(function(ms) {
+            [0,45,120,240,420,700,1050,1500,2100,3000,4200].forEach(function(ms) {
                 setTimeout(function(){ restorePageOnce(intent); }, ms);
             });
             return true;
@@ -10471,7 +10543,7 @@ class BrowserViewportMemory(MacroElement):
 class VisibleDrawToolbar(MacroElement):
     """固定顯示的中文 Leaflet Draw 工具列。
 
-    除既有畫線／畫點／畫範圍／節點編輯／刪除外，加入線段工具：
+    除既有畫線／畫點／畫範圍／節點編輯／批次刪除外，加入線段工具：
     - 截斷線：在線上點一下，把 LineString 分成兩段，並以紅色✂＋A/B段清楚標示。
     - 截取區間：在同一條線上點兩下，只保留兩點之間的區間。
     - 合併相鄰線段：依序點兩條線，若最近端點在容許距離內即合併。
@@ -10489,6 +10561,8 @@ class VisibleDrawToolbar(MacroElement):
         var activeEdit = null;
         var activeDelete = null;
         var activeDraw = null;
+        var pendingDeleteLayers = [];
+        var deleteButton = null;
 
         // 線段工具狀態 -------------------------------------------------
         var lineToolMode = null;       // split | extract | merge | overlap | status_pending | status_completed | null
@@ -10623,7 +10697,8 @@ class VisibleDrawToolbar(MacroElement):
 
         function finishLeafletTools() {
             activeEdit = stopTool(activeEdit, true);
-            activeDelete = stopTool(activeDelete, true);
+            // 批次刪除只有按下「完成刪除」才提交；切換其他工具時取消尚未提交的選取。
+            activeDelete = stopTool(activeDelete, false);
             activeDraw = stopTool(activeDraw, false);
         }
 
@@ -10851,6 +10926,154 @@ class VisibleDrawToolbar(MacroElement):
                     syncOutline(layer, !!selected);
                 }
             } catch(e) {}
+        }
+
+        // V3.6.62：刪除模式先把多個圖形加入待刪除清單，不立即移出 editGroup。
+        // 只有使用者按「完成刪除」時才批次 removeLayer，並只送出一次 draw:deleted。
+        function pendingDeleteIndex(layer) {
+            for (var i=0; i<pendingDeleteLayers.length; i++) {
+                if (pendingDeleteLayers[i] === layer) return i;
+            }
+            return -1;
+        }
+
+        function rememberDeleteStyle(layer) {
+            if (!layer || layer.__wraDeleteOriginalStyle) return;
+            var options = layer.options || {};
+            var style = {};
+            ['color','weight','opacity','fillColor','fillOpacity'].forEach(function(key){
+                if (options[key] !== undefined) style[key] = options[key];
+            });
+            // 選取時會加虛線；原本沒有 dashArray 也必須明確還原成 null。
+            style.dashArray = options.dashArray == null ? null : options.dashArray;
+            var markerOpacity = null;
+            try {
+                if (layer.options && layer.options.opacity !== undefined) markerOpacity = Number(layer.options.opacity);
+            } catch(e) {}
+            layer.__wraDeleteOriginalStyle = {style:style, markerOpacity:markerOpacity};
+        }
+
+        function showDeleteSelection(layer, selected) {
+            if (!layer) return;
+            try {
+                if (selected) {
+                    rememberDeleteStyle(layer);
+                    if (layer.setStyle) {
+                        var currentWeight = Number((layer.options || {}).weight || 3);
+                        layer.setStyle({
+                            color:'#DC2626', weight:Math.max(currentWeight + 2, 7), opacity:1,
+                            fillColor:'#FCA5A5', fillOpacity:0.65, dashArray:'8 6'
+                        });
+                    } else if (layer.setOpacity) {
+                        layer.setOpacity(0.55);
+                    }
+                    syncOutline(layer, true);
+                } else {
+                    var original = layer.__wraDeleteOriginalStyle || {};
+                    if (layer.setStyle && original.style) layer.setStyle(original.style);
+                    else if (layer.setOpacity && isFinite(original.markerOpacity)) layer.setOpacity(original.markerOpacity);
+                    syncOutline(layer, false);
+                    try { delete layer.__wraDeleteOriginalStyle; } catch(e) { layer.__wraDeleteOriginalStyle = null; }
+                }
+            } catch(e) {}
+        }
+
+        function updateBatchDeleteUi() {
+            var count = pendingDeleteLayers.length;
+            if (deleteButton) {
+                deleteButton.textContent = '✅ 完成刪除（' + count + '）';
+                deleteButton.style.background = '#fee2e2';
+                deleteButton.style.fontWeight = '700';
+            }
+            if (count > 0) {
+                setStatus('🗑 已選取 ' + count + ' 個待刪除圖形；可繼續點選，重複點擊可取消。完成後請按「完成刪除」。', false);
+            } else {
+                setStatus('🗑 批次刪除模式：請逐一點選圖形；可一次選取多個，再按「完成刪除」。', false);
+            }
+        }
+
+        function toggleBatchDelete(layer, ev) {
+            if (!activeDelete || !layer) return;
+            try {
+                if (ev && ev.originalEvent) L.DomEvent.stop(ev.originalEvent);
+            } catch(e) {}
+            var idx = pendingDeleteIndex(layer);
+            if (idx >= 0) {
+                pendingDeleteLayers.splice(idx, 1);
+                showDeleteSelection(layer, false);
+            } else {
+                pendingDeleteLayers.push(layer);
+                showDeleteSelection(layer, true);
+            }
+            updateBatchDeleteUi();
+        }
+
+        function bindBatchDeleteLayer(layer) {
+            if (!layer || !layer.on || layer.__wraBatchDeleteHandler) return;
+            layer.__wraBatchDeleteHandler = function(ev){ toggleBatchDelete(layer, ev); };
+            layer.on('click', layer.__wraBatchDeleteHandler);
+            try {
+                if (layer.getElement && layer.getElement() && layer.getElement().style) {
+                    layer.__wraBatchDeleteBaseCursor = layer.getElement().style.cursor || '';
+                    layer.getElement().style.cursor = 'crosshair';
+                }
+            } catch(e) {}
+        }
+
+        function unbindBatchDeleteLayer(layer) {
+            if (!layer) return;
+            try {
+                if (layer.off && layer.__wraBatchDeleteHandler) layer.off('click', layer.__wraBatchDeleteHandler);
+            } catch(e) {}
+            try { delete layer.__wraBatchDeleteHandler; } catch(e) { layer.__wraBatchDeleteHandler = null; }
+            try {
+                if (layer.getElement && layer.getElement() && layer.getElement().style) {
+                    layer.getElement().style.cursor = layer.__wraBatchDeleteBaseCursor || '';
+                }
+                delete layer.__wraBatchDeleteBaseCursor;
+            } catch(e) {}
+        }
+
+        function finishBatchDelete(commit) {
+            var chosen = pendingDeleteLayers.slice();
+            try { editGroup.eachLayer(function(layer){ unbindBatchDeleteLayer(layer); }); } catch(e) {}
+            chosen.forEach(function(layer){ showDeleteSelection(layer, false); });
+            pendingDeleteLayers = [];
+            activeDelete = null;
+            var button = deleteButton;
+            deleteButton = null;
+            if (button) {
+                button.textContent = '🗑 刪除圖形';
+                button.style.background = '#ffffff';
+                button.style.fontWeight = '400';
+            }
+            if (!commit || chosen.length === 0) {
+                if (commit) setStatus('未選取任何圖形，沒有刪除內容。', false);
+                return;
+            }
+
+            var deletedGroup = L.featureGroup();
+            chosen.forEach(function(layer){
+                try {
+                    editGroup.removeLayer(layer);
+                    deletedGroup.addLayer(layer);
+                } catch(e) {}
+            });
+            clearResultVisuals();
+            renderAllScissors();
+            saveParentScroll();
+            setStatus('已一次刪除 ' + chosen.length + ' 個圖形並更新本次草稿；確認無誤後，請再按頁面下方的儲存按鈕。', false);
+            try { mapObj.fire('draw:deleted', {layers:deletedGroup}); } catch(e) {}
+        }
+
+        function startBatchDelete(button) {
+            pendingDeleteLayers = [];
+            deleteButton = button;
+            try { editGroup.eachLayer(function(layer){ bindBatchDeleteLayer(layer); }); } catch(e) {}
+            activeDelete = {
+                disable:function(){ finishBatchDelete(false); }
+            };
+            updateBatchDeleteUi();
         }
 
         function setReachStatus(layer, reachStatus) {
@@ -11296,7 +11519,12 @@ class VisibleDrawToolbar(MacroElement):
 
         try {
             editGroup.eachLayer(function(layer){ attachLineHandler(layer); syncOutline(layer,false); });
-            editGroup.on('layeradd', function(ev){ saveMapViewport(); attachLineHandler(ev.layer); syncOutline(ev.layer,false); });
+            editGroup.on('layeradd', function(ev){
+                saveMapViewport();
+                attachLineHandler(ev.layer);
+                syncOutline(ev.layer,false);
+                if (activeDelete) bindBatchDeleteLayer(ev.layer);
+            });
             editGroup.on('layerremove', function(ev){ saveMapViewport(); removeOutline(ev.layer); });
             mapObj.on('draw:edited', function(){ saveParentScroll(); setTimeout(syncAllOutlines,0); });
             mapObj.on('draw:created', function(){ saveParentScroll(); setTimeout(syncAllOutlines,0); });
@@ -11414,7 +11642,7 @@ class VisibleDrawToolbar(MacroElement):
                 var editBtn=btn('✏️ 編輯節點', function(b){
                     saveParentScroll();
                     cancelLineTool('');
-                    activeDelete=stopTool(activeDelete,true);
+                    activeDelete=stopTool(activeDelete,false);
                     activeDraw=stopTool(activeDraw,false);
                     if (!activeEdit) {
                         rememberEditorMode('edit_nodes');
@@ -11448,25 +11676,17 @@ class VisibleDrawToolbar(MacroElement):
                     editBtn.textContent='✏️ 編輯節點';
                     editBtn.style.background='#ffffff';
                     if (!activeDelete) {
-                        rememberEditorMode('delete_shapes');
                         if (!editGroup || !editGroup.getLayers || editGroup.getLayers().length===0) {
                             b.textContent='⚠️ 尚無可刪除圖形';
                             setTimeout(function(){b.textContent='🗑 刪除圖形';},1200);
                             return;
                         }
-                        activeDelete=new L.EditToolbar.Delete(mapObj,{featureGroup:editGroup});
-                        activeDelete.enable();
-                        b.textContent='✅ 完成刪除';
-                        b.style.background='#fee2e2';
+                        rememberEditorMode('delete_shapes');
+                        startBatchDelete(b);
                     } else {
                         rememberEditorMode('');
                         saveParentScroll();
-                        try { if (activeDelete.save) activeDelete.save(); } catch(e) {}
-                        try { activeDelete.disable(); } catch(e) {}
-                        activeDelete=null;
-                        b.textContent='🗑 刪除圖形';
-                        b.style.background='#ffffff';
-                        // activeDelete.save() 本身已觸發 draw:deleted；不要再送第二次事件。
+                        finishBatchDelete(true);
                     }
                 });
 
